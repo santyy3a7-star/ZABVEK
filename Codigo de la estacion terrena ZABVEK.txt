@@ -1,0 +1,164 @@
+/*
+ * ============================================================================
+ * CanSat PEU 2026 — Estación Terrena ESP32 (Optimizado para LabVIEW)
+ * ============================================================================
+ *
+ * Módulo LoRa : Reyax RYLR998 en Serial2 (GPIO16=RX, GPIO17=TX) a 115200 baud
+ *
+ * CONFIGURACIÓN LORA (IDÉNTICA a la del STM32):
+ * Banda      : 915 MHz
+ * SF         : 9DX
+ * BW         : 125 kHz (código 7)
+ * CR         : 4/5      (código 1)
+ * Preámbulo  : 12
+ * NETWORKID  : 5
+ * ADDRESS    : 2   (STM32 usa ADDRESS=1)
+ *
+ * SALIDA SERIAL PURA PARA LABVIEW (18 campos estrictos):
+ * PKT,Ax,Ay,Az,At,Vx,Vy,Vz,Vt,Yaw,Pitch,Roll,Temp,Press,Alt,Released,RSSI,SNR
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+
+/* ── Pines y velocidad ───────────────────────────────────────────────── */
+#define LORA_RX_PIN  16
+#define LORA_TX_PIN  17
+#define LORA_BAUD    115200
+
+/* ── Parámetros de red ───────────────────────────────────────────────── */
+#define LORA_BAND        "AT+BAND=915000000"
+#define LORA_PARAMETER  "AT+PARAMETER=7,7,1,12"
+#define LORA_ADDRESS    "AT+ADDRESS=2"
+#define LORA_NETWORKID  "AT+NETWORKID=5"
+
+/* ── Enviar comando AT en silencio ───────────────────────────────────── */
+static void lora_cmd(const char *cmd, uint32_t wait_ms)
+{
+    while (Serial2.available()) Serial2.read(); /* vaciar buffer */
+
+    Serial2.print(cmd);
+    Serial2.print("\r\n");
+
+    uint32_t t0 = millis();
+    while (millis() - t0 < wait_ms) {
+        if (Serial2.available()) {
+            char c = (char)Serial2.read();
+            if (c == '\n') break;
+        }
+    }
+}
+
+/* ── Procesar la trama +RCV del módulo Reyax ─────────────────────────── */
+static bool parse_rcv(const String &line,
+                      unsigned long &pkt,
+                      float &ax,  float &ay,  float &az,  float &at,
+                      float &vx,  float &vy,  float &vz,  float &vt,
+                      float &yaw, float &pitch, float &roll,
+                      float &temp, float &press,
+                      float &alt, int &released,
+                      int   &rssi, int   &snr)
+{
+    if (!line.startsWith("+RCV=")) return false;
+
+    int c1 = line.indexOf(',');
+    if (c1 < 0) return false;
+    int c2 = line.indexOf(',', c1+1);
+    if (c2 < 0) return false;
+
+    int cLast       = line.lastIndexOf(',');
+    int cBeforeLast = line.lastIndexOf(',', cLast-1);
+    if (cLast < 0 || cBeforeLast <= c2) return false;
+
+    String data = line.substring(c2+1,       cBeforeLast);
+    String sRSSI= line.substring(cBeforeLast+1, cLast);
+    String sSNR = line.substring(cLast+1);
+
+    data.trim(); sRSSI.trim(); sSNR.trim();
+    rssi = sRSSI.toInt();
+    snr  = sSNR.toInt();
+
+    /* Desempaquetar los 16 campos CSV que mandó el STM32 */
+    int n = sscanf(data.c_str(),
+        "%lu,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%d",
+        &pkt,
+        &ax,  &ay,  &az,  &at,
+        &vx,  &vy,  &vz,  &vt,
+        &yaw, &pitch, &roll,
+        &temp, &press,
+        &alt, &released);
+
+    return (n == 16);
+}
+
+/* ── SETUP ───────────────────────────────────────────────────────────── */
+void setup()
+{
+    Serial.begin(115200);
+    while (!Serial) delay(10);
+
+    Serial2.begin(LORA_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
+    delay(2000); // Esperar estabilización del módulo
+
+    /* Configuración inicial por hardware */
+    lora_cmd("AT",           500);
+    lora_cmd(LORA_BAND,      800);
+    lora_cmd(LORA_PARAMETER, 800);
+    lora_cmd(LORA_ADDRESS,   500);
+    lora_cmd(LORA_NETWORKID, 500);
+
+    while (Serial2.available()) Serial2.read(); /* Limpieza final */
+}
+
+/* ── LOOP PRINCIPAL ──────────────────────────────────────────────────── */
+void loop()
+{
+    if (!Serial2.available()) return;
+
+    String line = Serial2.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) return;
+
+    if (line.startsWith("+RCV="))
+    {
+        unsigned long pkt=0;
+        float ax=0,ay=0,az=0,at=0;
+        float vx=0,vy=0,vz=0,vt=0;
+        float yaw=0,pitch=0,roll=0;
+        float temp=0,press=0,alt=0;
+        int   released=0,rssi=0,snr=0;
+
+        if (parse_rcv(line, pkt,
+                      ax,ay,az,at,
+                      vx,vy,vz,vt,
+                      yaw,pitch,roll,
+                      temp,press,
+                      alt,released,
+                      rssi,snr))
+        {
+            /* * SALIDA ESTRICTA EN CSV: 
+             * LabVIEW leerá esto usando la constante de formato:
+             * %d,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%d,%d,%d
+             */
+            Serial.print(pkt);     Serial.print(',');
+            Serial.print(ax,2);    Serial.print(',');
+            Serial.print(ay,2);    Serial.print(',');
+            Serial.print(az,2);    Serial.print(',');
+            Serial.print(at,2);    Serial.print(',');
+            Serial.print(vx,2);    Serial.print(',');
+            Serial.print(vy,2);    Serial.print(',');
+            Serial.print(vz,2);    Serial.print(',');
+            Serial.print(vt,2);    Serial.print(',');
+            Serial.print(yaw,1);   Serial.print(',');
+            Serial.print(pitch,1); Serial.print(',');
+            Serial.print(roll,1);  Serial.print(',');
+            Serial.print(temp,2);  Serial.print(',');
+            
+            Serial.print(press,2); Serial.print(',');
+            Serial.print(alt,1);   Serial.print(',');
+            Serial.print(released);Serial.print(',');
+            Serial.print(rssi);    Serial.print(',');
+            Serial.println(snr);   // Termina la línea con '\n' para LabVIEW
+        }
+    }
+}

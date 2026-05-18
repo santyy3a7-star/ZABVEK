@@ -1,0 +1,454 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file    main.c
+  * @brief   CanSat PEU 2026 — STM32 Transmisor + Sistema de Liberación Autogiro
+  *
+  * Módulo LoRa : Reyax RYLR998 en USART1 (PA9=TX, PA10=RX) a 115200 baud
+  * Sensores    : BNO085 (I2C1, 0x4B) + BMP390 (I2C1, 0x76 o 0x77 auto-detectado)
+  * LED debug   : PC13 (activo bajo)
+  * MOSFET      : PA6  (activo alto)
+  *
+  * ┌──────────────────────────────────────────────────────────────────┐
+  * │  PARÁMETRO CLAVE — CAMBIA ANTES DE CADA PRUEBA:                 │
+  * │   #define ENABLE_NICROM_BURN  1  → competencia: quema real      │
+  * │   #define ENABLE_NICROM_BURN  0  → prueba: solo envía LoRa      │
+  * └──────────────────────────────────────────────────────────────────┘
+  *
+  * CONFIGURACIÓN LORA:
+  *   Banda: 915 MHz  |  SF7, BW=125 kHz, CR=4/5, Preamble=12
+  *   NETWORKID=5  |  STM32 ADDR=1  |  ESP32 ADDR=2
+  *
+  * PAYLOAD TELEMETRÍA (16 campos CSV):
+  *   PKT,Ax,Ay,Az,At,Vx,Vy,Vz,Vt,Yaw,Pitch,Roll,Temp,Press,Alt,Released
+  *
+  * PAYLOAD EVENTO NICROM:
+  *   NICROM_ACTIVADO,Alt=<m>,Apogeo=<m>,Burn=<0|1>
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+#include "main.h"
+#include "i2c.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* USER CODE BEGIN Includes */
+#include "sh2.h"
+#include "sh2_hal.h"
+#include "sh2_SensorValue.h"
+#include "sh2_err.h"
+#include "bmp3.h"
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+/* USER CODE END Includes */
+
+/* USER CODE BEGIN PD */
+
+/* ── LoRa / telemetría ─────────────────────────────────────────────── */
+#define TX_INTERVAL_MS         500u
+#define LORA_ACK_WAIT_MS       350u
+#define EMA_ALPHA              0.2f
+
+/* ── MOSFET / nicrom ───────────────────────────────────────────────── */
+#define ENABLE_NICROM_BURN     1           /* 1=competencia | 0=prueba        */
+#define MOSFET_GPIO_PORT       GPIOA
+#define MOSFET_GPIO_PIN        GPIO_PIN_6
+#define BURN_TIME_MS           3000u
+
+/* ── Lógica de descenso ────────────────────────────────────────────── */
+#define DESCENT_THRESHOLD_M    5.0f
+#define REQUIRED_CONFIRMATIONS 5
+#define ALT_CHECK_INTERVAL_MS  200u
+
+/* USER CODE END PD */
+
+/* USER CODE BEGIN PV */
+extern I2C_HandleTypeDef  hi2c1;
+extern UART_HandleTypeDef huart1;
+
+/* ── BNO085 ────────────────────────────────────────────────────────── */
+static sh2_Hal_t     sh2Hal;
+static const uint8_t BNO_ADDR = 0x4B;
+
+volatile float    g_ax_f=0, g_ay_f=0, g_az_f=0, g_at=0;
+volatile float    g_vx=0,   g_vy=0,   g_vz=0,   g_vt=0;
+volatile float    g_yaw=0,  g_pitch=0, g_roll=0;
+volatile uint32_t g_t_prev = 0;
+
+/* ── BMP390 ────────────────────────────────────────────────────────── */
+static struct bmp3_dev  bmp;
+static struct bmp3_data bmp_data;
+/*
+ *  bmp_addr se rellena dinámicamente en main() tras el i2c_probe().
+ *  Arranca en 0; si el probe falla, g_bmp_ok quedará != BMP3_OK
+ *  y nunca se leerá presión (fail-safe idéntico al código anterior).
+ */
+static uint8_t  bmp_addr = 0;   /* 8 bits: (addr_7bit << 1)                  */
+volatile float  g_temp   = 0, g_press = 0;
+volatile int8_t g_bmp_ok = -1;
+
+/* ── Altitud y liberación ──────────────────────────────────────────── */
+static float   g_baseline_hpa = 1013.25f;
+volatile float g_altitude     = 0.0f;
+static float   g_max_altitude = 0.0f;
+static int     g_conf_count   = 0;
+static uint8_t g_release_done = 0;
+
+volatile uint32_t g_pkt = 0;
+
+/* USER CODE END PV */
+
+void SystemClock_Config(void);
+
+/* ══════════════════════════════════════════════════════════════════════
+   FUNCIONES AUXILIARES
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* USER CODE BEGIN 0 */
+
+/* ── Probe I2C: 1 si la dirección 7-bit responde ─────────────────── */
+static uint8_t i2c_probe(uint8_t addr_7bit)
+{
+    return HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr_7bit << 1), 3, 50)
+           == HAL_OK ? 1 : 0;
+}
+
+/* ── BMP390 bridge ─────────────────────────────────────────────────── */
+static BMP3_INTF_RET_TYPE bmp_read(uint8_t reg, uint8_t *buf,
+                                    uint32_t len, void *ptr)
+{
+    return HAL_I2C_Mem_Read(&hi2c1, *(uint8_t*)ptr, reg,
+                            I2C_MEMADD_SIZE_8BIT, buf, len, 200)
+           == HAL_OK ? BMP3_OK : BMP3_E_COMM_FAIL;
+}
+static BMP3_INTF_RET_TYPE bmp_write(uint8_t reg, const uint8_t *buf,
+                                     uint32_t len, void *ptr)
+{
+    return HAL_I2C_Mem_Write(&hi2c1, *(uint8_t*)ptr, reg,
+                             I2C_MEMADD_SIZE_8BIT, (uint8_t*)buf, len, 200)
+           == HAL_OK ? BMP3_OK : BMP3_E_COMM_FAIL;
+}
+static void bmp_delay(uint32_t us, void *ptr)
+{ (void)ptr; HAL_Delay(us / 1000 + 1); }
+
+/* ── BNO085 bridge ─────────────────────────────────────────────────── */
+static int sh2hal_read(sh2_Hal_t *h, uint8_t *buf,
+                       unsigned len, uint32_t *t)
+{
+    (void)h;
+    if (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_8) == GPIO_PIN_SET) return 0;
+    unsigned n = len > 256 ? 256 : len;
+    if (HAL_I2C_Master_Receive(&hi2c1, BNO_ADDR << 1, buf, n, 200) != HAL_OK)
+        return 0;
+    uint16_t tot = (uint16_t)buf[0] | ((uint16_t)(buf[1] & 0x7F) << 8);
+    if (tot < 4 || tot > n) return 0;
+    *t = HAL_GetTick() * 1000;
+    return (int)tot;
+}
+static int sh2hal_write(sh2_Hal_t *h, uint8_t *buf, unsigned len)
+{
+    (void)h;
+    return HAL_I2C_Master_Transmit(&hi2c1, BNO_ADDR << 1, buf, len, 200)
+           == HAL_OK ? (int)len : -1;
+}
+static void     sh2hal_close (sh2_Hal_t *h) { (void)h; }
+static int      sh2hal_open  (sh2_Hal_t *h) { (void)h; return 0; }
+static uint32_t sh2hal_getUs (sh2_Hal_t *h) { (void)h; return HAL_GetTick() * 1000; }
+
+/* ── Sensor callback BNO085 ────────────────────────────────────────── */
+static void sensor_cb(void *cookie, sh2_SensorEvent_t *ev)
+{
+    (void)cookie;
+    sh2_SensorValue_t v;
+    if (sh2_decodeSensorEvent(&v, ev) != 0) return;
+
+    if (v.sensorId == SH2_LINEAR_ACCELERATION)
+    {
+        float ax = v.un.linearAcceleration.x;
+        float ay = v.un.linearAcceleration.y;
+        float az = v.un.linearAcceleration.z;
+
+        g_ax_f = EMA_ALPHA * ax + (1.0f - EMA_ALPHA) * g_ax_f;
+        g_ay_f = EMA_ALPHA * ay + (1.0f - EMA_ALPHA) * g_ay_f;
+        g_az_f = EMA_ALPHA * az + (1.0f - EMA_ALPHA) * g_az_f;
+        g_at   = sqrtf(g_ax_f*g_ax_f + g_ay_f*g_ay_f + g_az_f*g_az_f);
+
+        uint32_t now = HAL_GetTick();
+        if (g_t_prev != 0) {
+            float dt = (float)(now - g_t_prev) / 1000.0f;
+            g_vx += g_ax_f * dt;
+            g_vy += g_ay_f * dt;
+            g_vz += g_az_f * dt;
+            g_vt  = sqrtf(g_vx*g_vx + g_vy*g_vy + g_vz*g_vz);
+        }
+        g_t_prev = now;
+    }
+    else if (v.sensorId == SH2_ROTATION_VECTOR)
+    {
+        float r = v.un.rotationVector.real,
+              i = v.un.rotationVector.i,
+              j = v.un.rotationVector.j,
+              k = v.un.rotationVector.k;
+        g_roll  = atan2f(2*(r*i + j*k), 1 - 2*(i*i + j*j)) * 57.2957795f;
+        float s = 2*(r*j - i*k);
+        g_pitch = fabsf(s) >= 1 ? copysignf(90, s) : asinf(s) * 57.2957795f;
+        g_yaw   = atan2f(2*(r*k + i*j), 1 - 2*(j*j + k*k)) * 57.2957795f;
+    }
+}
+
+/* ── Comando AT LoRa ───────────────────────────────────────────────── */
+static uint8_t lora_cmd(const char *cmd, uint32_t timeout_ms)
+{
+    { uint8_t d; while (HAL_UART_Receive(&huart1, &d, 1, 2) == HAL_OK) {} }
+    HAL_UART_Transmit(&huart1, (uint8_t*)cmd, strlen(cmd), 500);
+
+    char    rx[128] = {0};
+    uint8_t idx = 0;
+    uint32_t t0 = HAL_GetTick();
+    while (HAL_GetTick() - t0 < timeout_ms) {
+        uint8_t c;
+        if (HAL_UART_Receive(&huart1, &c, 1, 5) == HAL_OK) {
+            if (idx < sizeof(rx) - 1) rx[idx++] = (char)c;
+            if (strstr(rx, "+OK"))  return 1;
+            if (strstr(rx, "+ERR")) return 0;
+        }
+        sh2_service();
+    }
+    return 0;
+}
+
+/* ── Presión → altitud relativa (ICAO) ────────────────────────────── */
+static float pressure_to_altitude(float press_hpa, float base_hpa)
+{
+    return 44330.0f * (1.0f - powf(press_hpa / base_hpa, 0.1902949f));
+}
+
+/* ── Activar sistema de liberación ────────────────────────────────── */
+static void activate_release(float alt, float max_alt)
+{
+#if ENABLE_NICROM_BURN
+    HAL_GPIO_WritePin(MOSFET_GPIO_PORT, MOSFET_GPIO_PIN, GPIO_PIN_SET);
+    HAL_Delay(BURN_TIME_MS);
+    HAL_GPIO_WritePin(MOSFET_GPIO_PORT, MOSFET_GPIO_PIN, GPIO_PIN_RESET);
+#endif
+
+    char payload[80], cmd[120];
+    snprintf(payload, sizeof(payload),
+             "NICROM_ACTIVADO,Alt=%.1f,Apogeo=%.1f,Burn=%d",
+             alt, max_alt, ENABLE_NICROM_BURN);
+    snprintf(cmd, sizeof(cmd), "AT+SEND=2,%d,%s\r\n",
+             (int)strlen(payload), payload);
+
+    for (int i = 0; i < 3; i++) {
+        if (lora_cmd(cmd, LORA_ACK_WAIT_MS)) break;
+        HAL_Delay(200);
+    }
+}
+
+/* USER CODE END 0 */
+
+/* ══════════════════════════════════════════════════════════════════════
+   MAIN
+   ══════════════════════════════════════════════════════════════════════ */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_I2C1_Init();          /* I2C primero — igual que en el código que funcionó */
+    MX_USART1_UART_Init();
+    MX_USART2_UART_Init();
+
+    /* USER CODE BEGIN 2 */
+
+        /* ── 0. MOSFET GPIO ────────────────────────────────────────────── */
+        {
+            GPIO_InitTypeDef gm = {0};
+            gm.Pin   = MOSFET_GPIO_PIN;
+            gm.Mode  = GPIO_MODE_OUTPUT_PP;
+            gm.Pull  = GPIO_NOPULL;
+            gm.Speed = GPIO_SPEED_FREQ_LOW;
+            __HAL_RCC_GPIOA_CLK_ENABLE();
+            HAL_GPIO_Init(MOSFET_GPIO_PORT, &gm);
+            HAL_GPIO_WritePin(MOSFET_GPIO_PORT, MOSFET_GPIO_PIN, GPIO_PIN_RESET);
+        }
+
+        /* ── 1. LIMPIEZA DE BUS I2C (Reinicio del BNO085) ──────────────── */
+        /* Hacemos esto PRIMERO para asegurar que el bus I2C esté libre     */
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
+        HAL_Delay(10);
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
+        HAL_Delay(300);
+
+        /* ── 2. BMP390 — auto-detección de dirección ───────────────────── */
+        if (i2c_probe(0x76)) {
+            bmp_addr = 0x76 << 1;
+        } else if (i2c_probe(0x77)) {
+            bmp_addr = 0x77 << 1;
+        }
+
+        bmp.intf     = BMP3_I2C_INTF;
+        bmp.read     = bmp_read;
+        bmp.write    = bmp_write;
+        bmp.delay_us = bmp_delay;
+        bmp.intf_ptr = &bmp_addr;
+        g_bmp_ok     = bmp3_init(&bmp);
+
+        if (g_bmp_ok == BMP3_OK) {
+            struct bmp3_settings s = {0};
+            s.press_en            = BMP3_ENABLE;
+            s.temp_en             = BMP3_ENABLE;
+            s.odr_filter.press_os = BMP3_OVERSAMPLING_8X;
+            s.odr_filter.temp_os  = BMP3_OVERSAMPLING_2X;
+            s.odr_filter.odr      = BMP3_ODR_12_5_HZ;
+            bmp3_set_sensor_settings(BMP3_SEL_PRESS_EN | BMP3_SEL_TEMP_EN |
+                                     BMP3_SEL_PRESS_OS | BMP3_SEL_TEMP_OS |
+                                     BMP3_SEL_ODR, &s, &bmp);
+            s.op_mode = BMP3_MODE_NORMAL;
+            bmp3_set_op_mode(&s, &bmp);
+        }
+
+        /* ── 3. BNO085 — Inicialización de librería ────────────────────── */
+        sh2Hal.open      = sh2hal_open;
+        sh2Hal.close     = sh2hal_close;
+        sh2Hal.read      = sh2hal_read;
+        sh2Hal.write     = sh2hal_write;
+        sh2Hal.getTimeUs = sh2hal_getUs;
+
+        if (sh2_open(&sh2Hal, NULL, NULL) == 0) {
+            sh2_setSensorCallback(sensor_cb, NULL);
+            sh2_SensorConfig_t cfg = {0};
+            cfg.reportInterval_us = 50000;   /* 20 Hz */
+            sh2_setSensorConfig(SH2_LINEAR_ACCELERATION, &cfg);
+            sh2_setSensorConfig(SH2_ROTATION_VECTOR,     &cfg);
+        }
+
+        /* ── 4. Calibración de presión base (referencia suelo = 0 m) ───── */
+        if (g_bmp_ok == BMP3_OK) {
+            HAL_Delay(500);
+            float sum = 0.0f;
+            for (int i = 0; i < 10; i++) {
+                bmp3_get_sensor_data(BMP3_PRESS | BMP3_TEMP, &bmp_data, &bmp);
+                sum += (float)(bmp_data.pressure / 100.0);
+                HAL_Delay(150);
+            }
+            g_baseline_hpa = sum / 10.0f;
+        }
+
+        /* ── 5. RYLR998 — configuración ────────────────────────────────── */
+        HAL_Delay(1000);
+        lora_cmd("AT\r\n",                     500);
+        lora_cmd("AT+BAND=915000000\r\n",      500);
+        lora_cmd("AT+PARAMETER=7,7,1,12\r\n", 500);
+        lora_cmd("AT+ADDRESS=1\r\n",           500);
+        lora_cmd("AT+NETWORKID=5\r\n",         500);
+        { uint8_t d; while (HAL_UART_Receive(&huart1, &d, 1, 5) == HAL_OK) {} }
+
+        uint32_t last_tx      = HAL_GetTick();
+        uint32_t last_alt_chk = HAL_GetTick();
+
+        /* USER CODE END 2 */
+
+    /* ══════════════════════════════════════════════════════════════════
+       LOOP PRINCIPAL
+       ══════════════════════════════════════════════════════════════════ */
+    while (1)
+    {
+        sh2_service();
+        uint32_t now = HAL_GetTick();
+
+        /* ── A. Altitud + lógica de liberación (cada 200 ms) ─────────── */
+        if ((now - last_alt_chk) >= ALT_CHECK_INTERVAL_MS && g_bmp_ok == BMP3_OK)
+        {
+            last_alt_chk = now;
+
+            bmp3_get_sensor_data(BMP3_PRESS | BMP3_TEMP, &bmp_data, &bmp);
+            g_temp     = (float)bmp_data.temperature;
+            g_press    = (float)(bmp_data.pressure / 100.0);
+            g_altitude = pressure_to_altitude(g_press, g_baseline_hpa);
+
+            if (!g_release_done)
+            {
+                if (g_altitude > g_max_altitude)
+                    g_max_altitude = g_altitude;
+
+                if (g_altitude < (g_max_altitude - DESCENT_THRESHOLD_M))
+                    g_conf_count++;
+                else
+                    if (g_conf_count > 0) g_conf_count--;
+
+                if (g_conf_count >= REQUIRED_CONFIRMATIONS) {
+                    g_release_done = 1;
+                    activate_release(g_altitude, g_max_altitude);
+                }
+            }
+        }
+
+        /* ── B. Telemetría LoRa (cada 500 ms) ────────────────────────── */
+        if ((now - last_tx) >= TX_INTERVAL_MS)
+        {
+            last_tx = now;
+            g_pkt++;
+
+            char payload[200];
+            snprintf(payload, sizeof(payload),
+                "%lu,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.1f,%.1f,%.1f,%.2f,%.2f,%.1f,%d",
+                g_pkt,
+                g_ax_f, g_ay_f, g_az_f, g_at,
+                g_vx,   g_vy,   g_vz,   g_vt,
+                g_yaw,  g_pitch, g_roll,
+                g_temp, g_press,
+                g_altitude,
+                (int)g_release_done);
+
+            char cmd[260];
+            snprintf(cmd, sizeof(cmd), "AT+SEND=2,%d,%s\r\n",
+                     (int)strlen(payload), payload);
+
+            uint8_t ok = lora_cmd(cmd, LORA_ACK_WAIT_MS);
+
+            if (ok) {
+                HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+            } else {
+                for (int i = 0; i < 3; i++) {
+                    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+                    HAL_Delay(80);
+                }
+            }
+        }
+    }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   SYSTEM CLOCK
+   ══════════════════════════════════════════════════════════════════════ */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+    osc.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
+    osc.HSIState            = RCC_HSI_ON;
+    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    osc.PLL.PLLState        = RCC_PLL_ON;
+    osc.PLL.PLLSource       = RCC_PLLSOURCE_HSI;
+    osc.PLL.PLLM = 8; osc.PLL.PLLN = 100;
+    osc.PLL.PLLP = RCC_PLLP_DIV2; osc.PLL.PLLQ = 4;
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK) Error_Handler();
+    clk.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                       | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    clk.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+    clk.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+    clk.APB1CLKDivider = RCC_HCLK_DIV2;
+    clk.APB2CLKDivider = RCC_HCLK_DIV1;
+    if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_3) != HAL_OK) Error_Handler();
+}
+
+void Error_Handler(void) { __disable_irq(); while (1) {} }
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line) { (void)file; (void)line; }
+#endif
