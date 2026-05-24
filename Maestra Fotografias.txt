@@ -1,0 +1,838 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// XIAO MAESTRA (Izquierda) — v6.0 | Misión PEU 2026
+// Procesamiento de anaglifo 3D a BORDO
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Novedad principal respecto a v5.0:
+//   En vez de transmitir dos JPEGs separados por ESP-NOW, la Maestra:
+//     1. Decodifica JPEG izquierda → buffer RGB565 en PSRAM
+//     2. Recibe JPEG derecha del Esclavo por UART
+//     3. Decodifica JPEG derecha  → buffer RGB565 en PSRAM
+//     4. Mezcla canales: R ← izq, G+B ← der  (anaglifo rojo-cian)
+//     5. Re-codifica anaglifo RGB565 → JPEG
+//     6. Transmite UN solo JPEG (el anaglifo) por ESP-NOW
+//     7. Guarda ese mismo JPEG en LittleFS (caja negra) si fue disparo STM32
+//
+// Uso de memoria PSRAM (máx ~3 MB en uso simultáneo de 8 MB disponibles):
+//   jpegIzqBuf   → hasta 250 KB  (JPEG raw izquierda)
+//   jpegDerBuf   → hasta 250 KB  (JPEG raw derecha)
+//   rgbIzqBuf    → 800×600×2 = 960 KB  (RGB565 decodificado)
+//   rgbDerBuf    → 800×600×2 = 960 KB  (RGB565 decodificado)
+//   anaglifoBuf  → hasta 250 KB  (JPEG re-codificado resultado)
+//   TOTAL        ≈ 2.7 MB usados de 8 MB disponibles ✓
+//
+// Decode JPEG → RGB565:
+//   Usa esp_jpg_decode() del componente esp_jpeg del IDF, disponible en
+//   Arduino ESP32 core ≥ 2.0.0 sin librerías adicionales.
+//   Header: #include "img_converters.h"  (incluido en esp32-camera)
+//
+// ─── Tabla de comandos ───────────────────────────────────────
+//   RF 0xFF       → Captura + anaglifo SVGA, solo TX ESP-NOW
+//   RF 0xFE       → Captura + anaglifo XGA, solo TX ESP-NOW
+//   GPIO 2 HIGH   → Captura + anaglifo XGA + guarda LittleFS + TX ESP-NOW
+//                   Temporizador 10s: si no llega F/M, duerme la Esclava
+//   RF 0xFD magic → Dormir Esclava (Maestra sigue activa)
+//   RF 0xFC magic → Pulso GPIO3→STM32 B3 + dormir Esclava + deep sleep Maestra
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include "esp_camera.h"
+#include "esp_heap_caps.h"
+#include "img_converters.h"       // fmt2rgb888, jpg2rgb565 vía esp32-camera
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include "FS.h"
+#include <LittleFS.h>
+
+// ─── MAC de la Base Terrena ───────────────────────────────────
+// ¡ACTUALIZA con la MAC real de tu ESP32 Base!
+uint8_t GROUND_MAC[] = {0x00, 0x70, 0x07, 0x26, 0x53, 0x24};
+
+// ─── Pines ────────────────────────────────────────────────────
+#define PIN_TRIGGER_STM32   2    // INPUT  desde STM32 B0
+#define PIN_CHUTE_RELEASE   3    // OUTPUT hacia STM32 B3 (paracaídas)
+#define LED_INDICATOR      21
+#define UART_TX_PIN        43
+#define UART_RX_PIN        44
+#define UART_BAUD          921600
+
+// ─── Resolución ───────────────────────────────────────────────
+#define JPEG_QUALITY_STD   15
+#define FRAME_SIZE_STD     FRAMESIZE_SVGA    // 800×600
+#define JPEG_QUALITY_HQ    10
+#define FRAME_SIZE_HQ      FRAMESIZE_XGA     // 1024×768
+
+// ─── Dimensiones de frame para calcular buffers RGB565 ────────
+// Se usan las dimensiones SVGA porque es el modo más frecuente.
+// En modo HQ (XGA) los buffers son suficientemente grandes igual
+// ya que MAX_IMG_SIZE cubre ambos.
+#define IMG_W_STD    800
+#define IMG_H_STD    600
+#define IMG_W_HQ    1024
+#define IMG_H_HQ     768
+
+// El buffer RGB565 más grande es XGA: 1024×768×2 = 1,572,864 bytes ≈ 1.5 MB
+// Con SVGA: 800×600×2 = 960,000 bytes ≈ 960 KB
+// Asignamos para el caso XGA para no tener que realocar
+#define RGB_BUF_SIZE  (1024UL * 768UL * 2UL)   // 1.5 MB por buffer
+
+// ─── ESP-NOW ──────────────────────────────────────────────────
+#define ESPNOW_CHANNEL    1
+#define ESPNOW_RETRIES   10
+#define ESPNOW_TIMEOUT   80     // ms por ACK
+#define INTER_PKT_DELAY   8     // ms entre paquetes
+#define ESPNOW_MAGIC   0xC5A7
+#define MAX_IMG_SIZE   (300UL * 1024)   // 300 KB máx para JPEG resultado
+
+// ─── Tipos de paquete ─────────────────────────────────────────
+#define PKT_IMG_START  0x01
+#define PKT_IMG_CHUNK  0x02
+#define PKT_IMG_END    0x03
+#define PKT_HEARTBEAT  0x04
+#define IMG_ANAGLIFO   0x00   // ID de imagen única: el anaglifo
+
+// ─── Protocolo UART con Esclava ───────────────────────────────
+static const uint8_t FRAME_START[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+static const uint8_t FRAME_END[4]   = {0xDD, 0xCC, 0xBB, 0xAA};
+#define SYNC_BYTE_STD    0x53
+#define SYNC_BYTE_HQ     0x54
+#define SYNC_BYTE_SLEEP  0x55
+#define READY_BYTE       0x52
+
+// ─── Gestión de energía ───────────────────────────────────────
+#define SLAVE_SLEEP_TIMEOUT_MS  10000
+#define CHUTE_PULSE_MS            200
+
+// ─── Cámara (XIAO ESP32-S3 Sense) ────────────────────────────
+#define PWDN_GPIO_NUM   -1
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM   10
+#define SIOD_GPIO_NUM   40
+#define SIOC_GPIO_NUM   39
+#define Y9_GPIO_NUM     48
+#define Y8_GPIO_NUM     11
+#define Y7_GPIO_NUM     12
+#define Y6_GPIO_NUM     14
+#define Y5_GPIO_NUM     16
+#define Y4_GPIO_NUM     18
+#define Y3_GPIO_NUM     17
+#define Y2_GPIO_NUM     15
+#define VSYNC_GPIO_NUM  38
+#define HREF_GPIO_NUM   47
+#define PCLK_GPIO_NUM   13
+
+// ─── LittleFS ─────────────────────────────────────────────────
+#define LFS_PARTITION_LABEL "spiffs"
+#define LFS_MAX_FILES        4
+
+// ─── Paquete ESP-NOW ──────────────────────────────────────────
+#define CHUNK_DATA_SIZE 230
+#pragma pack(push, 1)
+struct EspNowPacket {
+  uint16_t magic;
+  uint8_t  type;
+  uint8_t  session;
+  uint8_t  img_id;
+  uint16_t chunk_idx;
+  uint16_t total_chunks;
+  uint8_t  data_len;
+  uint8_t  data[CHUNK_DATA_SIZE];
+  uint16_t crc16;
+};
+#pragma pack(pop)
+
+// ─── Variables globales ───────────────────────────────────────
+volatile bool deliveryDone = false;
+volatile bool deliveryOK   = false;
+
+volatile bool cmd_captura_std = false;
+volatile bool cmd_captura_hq  = false;
+volatile bool cmd_sleep_slave = false;
+volatile bool cmd_emergency   = false;
+
+volatile bool slaveDormida    = false;
+uint8_t       currentSession  = 0;
+
+// ── Buffers en PSRAM ─────────────────────────────────────────
+uint8_t* jpegIzqBuf  = nullptr;   // JPEG crudo izquierda
+uint8_t* jpegDerBuf  = nullptr;   // JPEG crudo derecha
+uint8_t* rgbIzqBuf   = nullptr;   // RGB565 decodificado izquierda
+uint8_t* rgbDerBuf   = nullptr;   // RGB565 decodificado derecha
+uint8_t* anaglifoBuf = nullptr;   // JPEG resultado anaglifo
+
+uint32_t jpegIzqLen  = 0;
+uint32_t jpegDerLen  = 0;
+uint32_t anaglifoLen = 0;
+
+// Dimensiones reales del frame capturado (se detectan al decodificar)
+uint32_t frameW = 0;
+uint32_t frameH = 0;
+
+// Temporizador post-trigger STM32
+unsigned long t_trigger_stm32       = 0;
+bool          esperando_post_trigger = false;
+
+// Heartbeat
+unsigned long t_ultimo_latido = 0;
+
+// ─── CRC helpers ─────────────────────────────────────────────
+uint16_t calcCRC16(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (int j = 0; j < 8; j++)
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+  }
+  return crc;
+}
+
+uint32_t calcCRC32(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc >> 1) ^ (0xEDB88320UL & (uint32_t)(-(int32_t)(crc & 1)));
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+// ─── Callbacks ESP-NOW ────────────────────────────────────────
+void onDataSent(const wifi_tx_info_t* tx_info, esp_now_send_status_t status) {
+  deliveryOK   = (status == ESP_NOW_SEND_SUCCESS);
+  deliveryDone = true;
+}
+
+void onComandoRecibido(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len == 1) {
+    if (data[0] == 0xFF) cmd_captura_std = true;
+    if (data[0] == 0xFE) cmd_captura_hq  = true;
+  } else if (len == 7) {
+    if (data[0] == 0xFD &&
+        data[1]==0xDE && data[2]==0xAD && data[3]==0xBE &&
+        data[4]==0xEF && data[5]==0x42 && data[6]==0x24)
+      cmd_sleep_slave = true;
+
+    if (data[0] == 0xFC &&
+        data[1]==0xA5 && data[2]==0x5A && data[3]==0xFF &&
+        data[4]==0x00 && data[5]==0x13 && data[6]==0x37)
+      cmd_emergency = true;
+  }
+}
+
+// ─── Init cámara ─────────────────────────────────────────────
+bool initCamera() {
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer  = LEDC_TIMER_0;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM;
+  cfg.pin_d2=Y4_GPIO_NUM; cfg.pin_d3=Y5_GPIO_NUM;
+  cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM;
+  cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM; cfg.pin_pclk=PCLK_GPIO_NUM;
+  cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sscb_sda=SIOD_GPIO_NUM; cfg.pin_sscb_scl=SIOC_GPIO_NUM;
+  cfg.pin_pwdn=PWDN_GPIO_NUM; cfg.pin_reset=RESET_GPIO_NUM;
+  cfg.xclk_freq_hz=10000000; cfg.pixel_format=PIXFORMAT_JPEG;
+  cfg.frame_size=FRAME_SIZE_STD; cfg.jpeg_quality=JPEG_QUALITY_STD;
+  cfg.fb_count=1; cfg.fb_location=CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode=CAMERA_GRAB_LATEST;
+  return esp_camera_init(&cfg) == ESP_OK;
+}
+
+// ─── Init ESP-NOW ─────────────────────────────────────────────
+bool initEspNow() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
+  esp_wifi_set_max_tx_power(76);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  if (esp_now_init() != ESP_OK) return false;
+  esp_now_register_send_cb(onDataSent);
+  esp_now_register_recv_cb(onComandoRecibido);
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, GROUND_MAC, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.encrypt  = false;
+  return esp_now_add_peer(&peer) == ESP_OK;
+}
+
+// ─── Init LittleFS ────────────────────────────────────────────
+bool initBlackBox() {
+  if (!LittleFS.begin(true, "/littlefs", LFS_MAX_FILES, LFS_PARTITION_LABEL)) {
+    Serial.println("[WARN] LittleFS no disponible");
+    return false;
+  }
+  if (!LittleFS.exists("/bb")) LittleFS.mkdir("/bb");
+  Serial.printf("[LFS] OK. Libre: %u KB\n",
+    (unsigned)(LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024);
+  return true;
+}
+
+// ─── Callback de decodificación JPEG ─────────────────────────
+// img_converters.h define jpg2rgb565() que llama a este callback
+// para escribir la salida RGB565 pixel a pixel en el buffer destino.
+// La firma debe coincidir exactamente con jpg_scale_mode_t pipeline.
+
+static uint8_t* s_rgb_out_ptr = nullptr;  // apunta al buffer destino actual
+
+bool jpegDecodeCallback(void* arg, size_t index, uint8_t* data, size_t len) {
+  // arg no se usa; index = offset en bytes dentro del buffer RGB565
+  if (!s_rgb_out_ptr) return false;
+  memcpy(s_rgb_out_ptr + index, data, len);
+  return true;
+}
+
+// ─── Decodificar JPEG → RGB565 en PSRAM ──────────────────────
+// Retorna true si OK. Llena w y h con las dimensiones reales.
+bool decodeJpegToRGB565(const uint8_t* jpegData, uint32_t jpegLen,
+                        uint8_t* outBuf, uint32_t outBufSize,
+                        uint32_t& outW, uint32_t& outH) {
+  s_rgb_out_ptr = outBuf;
+
+  // fmt2rgb888 y jpg2rgb565 están en img_converters.h del componente esp32-camera.
+  // jpg2rgb565 decodifica directamente a RGB565 (2 bytes por pixel, big-endian).
+  // Retorna true si la decodificación fue exitosa.
+  bool ok = jpg2rgb565(jpegData, jpegLen, outBuf, JPG_SCALE_NONE);
+  if (!ok) {
+    Serial.println("[DECODE] jpg2rgb565 falló");
+    s_rgb_out_ptr = nullptr;
+    return false;
+  }
+
+  // Obtener dimensiones reales del frame (necesarias para saber cuántos pixels hay)
+  // Las leemos del framebuffer que ya teníamos capturado, o podemos inferirlas
+  // desde el tamaño del buffer: len / 2 = W*H → con relación de aspecto conocida.
+  // La forma más robusta es usar esp_camera para leer el sensor activo.
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    frameinfo_t fi = s->get_framesize(s);  // Retorna el framesize enum activo
+    // Mapear enum a dimensiones
+    switch (fi) {
+      case FRAMESIZE_SVGA: outW = 800;  outH = 600;  break;
+      case FRAMESIZE_XGA:  outW = 1024; outH = 768;  break;
+      case FRAMESIZE_VGA:  outW = 640;  outH = 480;  break;
+      default:             outW = 800;  outH = 600;  break;
+    }
+  } else {
+    // Fallback: asumir SVGA
+    outW = 800; outH = 600;
+  }
+
+  uint32_t needed = outW * outH * 2;
+  if (needed > outBufSize) {
+    Serial.printf("[DECODE] Buffer insuficiente: necesito %u, tengo %u\n",
+                  needed, outBufSize);
+    s_rgb_out_ptr = nullptr;
+    return false;
+  }
+
+  s_rgb_out_ptr = nullptr;
+  return true;
+}
+
+// ─── Generar anaglifo rojo-cian en PSRAM ─────────────────────
+// Formato RGB565 little-endian (como produce jpg2rgb565):
+//   bits 15-11 = R (5 bits)
+//   bits 10-5  = G (6 bits)
+//   bits  4-0  = B (5 bits)
+//
+// Anaglifo: pixel_out.R ← pixel_izq.R   (ojo izquierdo = rojo)
+//           pixel_out.G ← pixel_der.G   (ojo derecho   = cian)
+//           pixel_out.B ← pixel_der.B
+//
+// Todo en PSRAM → sin copias a SRAM, sin problemas de stack.
+void mezclarAnaglifo(const uint8_t* rgbIzq, const uint8_t* rgbDer,
+                     uint8_t* rgbOut, uint32_t w, uint32_t h) {
+  uint32_t totalPixels = w * h;
+
+  for (uint32_t i = 0; i < totalPixels; i++) {
+    // Leer pixel izquierda (2 bytes, little-endian)
+    uint16_t pixIzq;
+    memcpy(&pixIzq, rgbIzq + i * 2, 2);
+
+    // Leer pixel derecha
+    uint16_t pixDer;
+    memcpy(&pixDer, rgbDer + i * 2, 2);
+
+    // Extraer canales (RGB565 little-endian)
+    uint8_t rIzq = (pixIzq >> 11) & 0x1F;   // 5 bits R izquierda
+
+    uint8_t gDer = (pixDer >> 5)  & 0x3F;   // 6 bits G derecha
+    uint8_t bDer =  pixDer        & 0x1F;   // 5 bits B derecha
+
+    // Construir pixel anaglifo: R←izq, G+B←der
+    uint16_t pixOut = ((uint16_t)rIzq << 11) |
+                      ((uint16_t)gDer <<  5) |
+                       (uint16_t)bDer;
+
+    memcpy(rgbOut + i * 2, &pixOut, 2);
+  }
+}
+
+// ─── Re-codificar RGB565 → JPEG ──────────────────────────────
+// Usa fmt2jpg() de img_converters.h: convierte de cualquier formato
+// pixel a JPEG. Aquí usamos RGB565 → JPEG con calidad ajustable.
+bool encodarAnaglifoJPEG(const uint8_t* rgbBuf, uint32_t w, uint32_t h,
+                         uint8_t calidad, uint8_t* outJpegBuf,
+                         uint32_t outBufSize, uint32_t& outLen) {
+  uint8_t* jpegPtr  = nullptr;
+  size_t   jpegSize = 0;
+
+  // fmt2jpg asigna memoria internamente con heap_caps_malloc SPIRAM si
+  // el parámetro out es nullptr. Luego copiamos al buffer propio y liberamos.
+  bool ok = fmt2jpg(rgbBuf, w * h * 2, w, h, PIXFORMAT_RGB565,
+                    calidad, &jpegPtr, &jpegSize);
+  if (!ok || !jpegPtr) {
+    Serial.println("[ENCODE] fmt2jpg falló");
+    return false;
+  }
+
+  if (jpegSize > outBufSize) {
+    Serial.printf("[ENCODE] JPEG resultado muy grande: %u bytes (máx %u)\n",
+                  (unsigned)jpegSize, outBufSize);
+    free(jpegPtr);
+    return false;
+  }
+
+  memcpy(outJpegBuf, jpegPtr, jpegSize);
+  outLen = (uint32_t)jpegSize;
+  free(jpegPtr);
+
+  Serial.printf("[ENCODE] Anaglifo JPEG listo: %u bytes\n", outLen);
+  return true;
+}
+
+// ─── Recibir imagen del Esclavo por UART ─────────────────────
+bool receiveRightImageUART() {
+  enum State { FIND_START, READ_LEN, READ_DATA, READ_CRC, READ_END };
+  State   state     = FIND_START;
+  uint8_t startHits = 0;
+  uint8_t lenBuf[4], crcBuf[4];
+  uint8_t lenIdx=0, crcIdx=0, endIdx=0;
+  uint32_t imgLen=0, bytesRead=0, receivedCRC=0;
+  uint32_t t0 = millis();
+  jpegDerLen = 0;
+
+  while (millis() - t0 < 25000) {
+    if (!Serial1.available()) { yield(); continue; }
+    uint8_t b = Serial1.read();
+
+    switch (state) {
+      case FIND_START:
+        if (b == FRAME_START[startHits]) {
+          startHits++;
+          if (startHits == 4) { state = READ_LEN; lenIdx = 0; startHits = 0; }
+        } else {
+          startHits = (b == FRAME_START[0]) ? 1 : 0;
+        }
+        break;
+
+      case READ_LEN:
+        lenBuf[lenIdx++] = b;
+        if (lenIdx == 4) {
+          memcpy(&imgLen, lenBuf, 4);
+          if (imgLen == 0 || imgLen > MAX_IMG_SIZE) {
+            state = FIND_START; startHits = 0;
+          } else {
+            bytesRead = 0; state = READ_DATA;
+          }
+        }
+        break;
+
+      case READ_DATA:
+        jpegDerBuf[bytesRead++] = b;
+        if (bytesRead >= imgLen) { state = READ_CRC; crcIdx = 0; }
+        break;
+
+      case READ_CRC:
+        crcBuf[crcIdx++] = b;
+        if (crcIdx == 4) {
+          memcpy(&receivedCRC, crcBuf, 4);
+          state = READ_END; endIdx = 0;
+        }
+        break;
+
+      case READ_END:
+        endIdx++;
+        if (endIdx == 4) {
+          uint32_t calcCRC = calcCRC32(jpegDerBuf, imgLen);
+          if (calcCRC == receivedCRC) {
+            jpegDerLen = imgLen;
+            return true;
+          }
+          Serial.println("[UART] CRC32 mismatch en imagen derecha");
+          return false;
+        }
+        break;
+    }
+  }
+  Serial.println("[UART] Timeout esperando imagen derecha");
+  return false;
+}
+
+// ─── Dormir la Esclava ────────────────────────────────────────
+void dormirEsclavo() {
+  if (slaveDormida) return;
+  Serial1.write(SYNC_BYTE_SLEEP);
+  Serial1.flush();
+  delay(50);
+  slaveDormida = true;
+  Serial.println("[PWR] Esclava enviada a deep sleep");
+}
+
+// ─── Guardar JPEG en LittleFS ─────────────────────────────────
+void guardarEnCajaNegra(uint8_t sesion, const uint8_t* data, uint32_t len) {
+  if (!data || len == 0) return;
+
+  // Rotar si quedan menos de 300 KB libres
+  if (LittleFS.totalBytes() - LittleFS.usedBytes() < 300 * 1024) {
+    char vieja[32];
+    snprintf(vieja, sizeof(vieja), "/bb/S%03u_ANA.jpg", (uint8_t)(sesion - 4));
+    LittleFS.remove(vieja);
+  }
+
+  char ruta[32];
+  snprintf(ruta, sizeof(ruta), "/bb/S%03u_ANA.jpg", sesion);
+  File f = LittleFS.open(ruta, FILE_WRITE);
+  if (!f) { Serial.printf("[LFS] Error abriendo %s\n", ruta); return; }
+  size_t escritos = f.write(data, len);
+  f.close();
+
+  if (escritos == len)
+    Serial.printf("[LFS ✓] %s (%u bytes)\n", ruta, len);
+  else
+    Serial.printf("[LFS ✗] %s (%u/%u bytes)\n", ruta, escritos, len);
+}
+
+// ─── Envío de paquete con reintentos ─────────────────────────
+bool sendPacketWithRetry(EspNowPacket& pkt) {
+  size_t crcLen = sizeof(pkt) - sizeof(pkt.crc16);
+  pkt.crc16 = calcCRC16((uint8_t*)&pkt, crcLen);
+  for (int attempt = 0; attempt < ESPNOW_RETRIES; attempt++) {
+    deliveryDone = false; deliveryOK = false;
+    esp_err_t err = esp_now_send(GROUND_MAC, (uint8_t*)&pkt, sizeof(pkt));
+    if (err != ESP_OK) { delay(10); continue; }
+    uint32_t t0 = millis();
+    while (!deliveryDone && (millis() - t0 < ESPNOW_TIMEOUT)) yield();
+    if (deliveryOK) return true;
+    delay(10);
+  }
+  return false;
+}
+
+// ─── Transmitir JPEG por ESP-NOW ─────────────────────────────
+bool transmitirJPEG(uint8_t imgId, const uint8_t* data, uint32_t len) {
+  if (!data || len == 0) return false;
+  uint32_t crc32      = calcCRC32(data, len);
+  uint16_t totalChunks = (len + CHUNK_DATA_SIZE - 1) / CHUNK_DATA_SIZE;
+
+  EspNowPacket pkt; memset(&pkt, 0, sizeof(pkt));
+  pkt.magic = ESPNOW_MAGIC; pkt.session = currentSession; pkt.img_id = imgId;
+
+  // PKT_IMG_START
+  pkt.type = PKT_IMG_START; pkt.chunk_idx = 0; pkt.total_chunks = totalChunks;
+  pkt.data_len = 8;
+  memcpy(pkt.data,     &len,   4);
+  memcpy(pkt.data + 4, &crc32, 4);
+  if (!sendPacketWithRetry(pkt)) return false;
+  delay(INTER_PKT_DELAY);
+
+  // PKT_IMG_CHUNK
+  for (uint16_t i = 0; i < totalChunks; i++) {
+    uint32_t offset  = (uint32_t)i * CHUNK_DATA_SIZE;
+    uint8_t  chunkSz = (uint8_t)min((uint32_t)CHUNK_DATA_SIZE, len - offset);
+    pkt.type = PKT_IMG_CHUNK; pkt.chunk_idx = i; pkt.data_len = chunkSz;
+    memcpy(pkt.data, data + offset, chunkSz);
+    if (!sendPacketWithRetry(pkt)) return false;
+    if (cmd_emergency) return false;  // Abortar si llega emergencia
+    delay(INTER_PKT_DELAY);
+  }
+
+  // PKT_IMG_END
+  pkt.type = PKT_IMG_END; pkt.chunk_idx = totalChunks; pkt.data_len = 4;
+  memcpy(pkt.data, &crc32, 4);
+  return sendPacketWithRetry(pkt);
+}
+
+// ─── Heartbeat ────────────────────────────────────────────────
+void enviarHeartbeat() {
+  EspNowPacket hb; memset(&hb, 0, sizeof(hb));
+  hb.magic   = ESPNOW_MAGIC;
+  hb.type    = PKT_HEARTBEAT;
+  hb.session = currentSession;
+  size_t crcLen = sizeof(hb) - sizeof(hb.crc16);
+  hb.crc16 = calcCRC16((uint8_t*)&hb, crcLen);
+  esp_now_send(GROUND_MAC, (uint8_t*)&hb, sizeof(hb));
+}
+
+// ══════════════════════════════════════════════════════════════
+// CICLO PRINCIPAL DE PROCESAMIENTO
+// ══════════════════════════════════════════════════════════════
+// Captura ambas cámaras, genera el anaglifo a bordo y lo transmite.
+// Si guardarEnFlash=true, también lo guarda en LittleFS.
+void cicloAnaglifo(bool altaCalidad, bool guardarEnFlash) {
+  sensor_t* s = esp_camera_sensor_get();
+
+  // ── 1. Configurar resolución ────────────────────────────────
+  if (altaCalidad) {
+    s->set_framesize(s, FRAME_SIZE_HQ);
+    s->set_quality(s, JPEG_QUALITY_HQ);
+    delay(250);
+  }
+
+  uint8_t calidadJpeg = altaCalidad ? JPEG_QUALITY_HQ : JPEG_QUALITY_STD;
+
+  // ── 2. Capturar imagen izquierda (Maestra) ─────────────────
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("[CAM] Error captura izquierda");
+    if (altaCalidad) { s->set_framesize(s, FRAME_SIZE_STD); s->set_quality(s, JPEG_QUALITY_STD); }
+    return;
+  }
+  if (fb->len > MAX_IMG_SIZE) {
+    Serial.printf("[CAM] JPEG izquierda muy grande: %u bytes\n", fb->len);
+    esp_camera_fb_return(fb);
+    if (altaCalidad) { s->set_framesize(s, FRAME_SIZE_STD); s->set_quality(s, JPEG_QUALITY_STD); }
+    return;
+  }
+  jpegIzqLen = fb->len;
+  memcpy(jpegIzqBuf, fb->buf, jpegIzqLen);
+  esp_camera_fb_return(fb);
+  Serial.printf("[CAM] JPEG izquierda: %u bytes\n", jpegIzqLen);
+
+  // ── 3. Solicitar imagen derecha al Esclavo ──────────────────
+  if (!slaveDormida) {
+    Serial1.write(altaCalidad ? SYNC_BYTE_HQ : SYNC_BYTE_STD);
+    Serial1.flush();
+
+    if (!receiveRightImageUART()) {
+      Serial.println("[UART] Fallo imagen derecha — transmitiendo solo izquierda como JPEG");
+      // Fallback: transmitir solo el JPEG izquierdo sin anaglifo
+      digitalWrite(LED_INDICATOR, LOW);
+      transmitirJPEG(IMG_ANAGLIFO, jpegIzqBuf, jpegIzqLen);
+      if (guardarEnFlash) guardarEnCajaNegra(currentSession, jpegIzqBuf, jpegIzqLen);
+      digitalWrite(LED_INDICATOR, HIGH);
+      currentSession++;
+      if (altaCalidad) { s->set_framesize(s, FRAME_SIZE_STD); s->set_quality(s, JPEG_QUALITY_STD); }
+      return;
+    }
+    Serial.printf("[UART] JPEG derecha: %u bytes\n", jpegDerLen);
+  } else {
+    Serial.println("[PWR] Esclava dormida — transmitiendo solo imagen izquierda");
+    digitalWrite(LED_INDICATOR, LOW);
+    transmitirJPEG(IMG_ANAGLIFO, jpegIzqBuf, jpegIzqLen);
+    if (guardarEnFlash) guardarEnCajaNegra(currentSession, jpegIzqBuf, jpegIzqLen);
+    digitalWrite(LED_INDICATOR, HIGH);
+    currentSession++;
+    if (altaCalidad) { s->set_framesize(s, FRAME_SIZE_STD); s->set_quality(s, JPEG_QUALITY_STD); }
+    return;
+  }
+
+  // ── 4. Decodificar JPEG izquierda → RGB565 ──────────────────
+  Serial.println("[3D] Decodificando izquierda…");
+  uint32_t wIzq = 0, hIzq = 0;
+  if (!decodeJpegToRGB565(jpegIzqBuf, jpegIzqLen, rgbIzqBuf, RGB_BUF_SIZE, wIzq, hIzq)) {
+    Serial.println("[3D] Fallo decode izquierda");
+    if (altaCalidad) { s->set_framesize(s, FRAME_SIZE_STD); s->set_quality(s, JPEG_QUALITY_STD); }
+    return;
+  }
+  frameW = wIzq; frameH = hIzq;
+  Serial.printf("[3D] Izquierda decodificada: %u×%u px\n", frameW, frameH);
+
+  // ── 5. Decodificar JPEG derecha → RGB565 ────────────────────
+  Serial.println("[3D] Decodificando derecha…");
+  uint32_t wDer = 0, hDer = 0;
+  if (!decodeJpegToRGB565(jpegDerBuf, jpegDerLen, rgbDerBuf, RGB_BUF_SIZE, wDer, hDer)) {
+    Serial.println("[3D] Fallo decode derecha — usando solo izquierda");
+    transmitirJPEG(IMG_ANAGLIFO, jpegIzqBuf, jpegIzqLen);
+    if (guardarEnFlash) guardarEnCajaNegra(currentSession, jpegIzqBuf, jpegIzqLen);
+    currentSession++;
+    if (altaCalidad) { s->set_framesize(s, FRAME_SIZE_STD); s->set_quality(s, JPEG_QUALITY_STD); }
+    return;
+  }
+
+  // Si las resoluciones no coinciden (no debería pasar), usar la menor
+  if (wDer != wIzq || hDer != hIzq) {
+    Serial.printf("[3D] WARN: dimensiones distintas izq=%u×%u der=%u×%u — usando menor\n",
+                  wIzq, hIzq, wDer, hDer);
+    frameW = min(wIzq, wDer);
+    frameH = min(hIzq, hDer);
+  }
+
+  // ── 6. Mezclar canales → anaglifo en PSRAM ──────────────────
+  Serial.println("[3D] Generando anaglifo…");
+  digitalWrite(LED_INDICATOR, LOW);
+
+  // Usar rgbIzqBuf como buffer de salida del anaglifo para ahorrar memoria.
+  // Después de esta llamada rgbIzqBuf contiene el anaglifo RGB565.
+  // rgbDerBuf ya no se necesita pero sigue en PSRAM (no se libera).
+  mezclarAnaglifo(rgbIzqBuf, rgbDerBuf, rgbIzqBuf, frameW, frameH);
+
+  // ── 7. Re-codificar anaglifo RGB565 → JPEG ──────────────────
+  Serial.println("[3D] Re-codificando a JPEG…");
+  if (!encodarAnaglifoJPEG(rgbIzqBuf, frameW, frameH,
+                            calidadJpeg,
+                            anaglifoBuf, MAX_IMG_SIZE, anaglifoLen)) {
+    Serial.println("[3D] Fallo re-encode — usando JPEG izquierda cruda");
+    transmitirJPEG(IMG_ANAGLIFO, jpegIzqBuf, jpegIzqLen);
+    if (guardarEnFlash) guardarEnCajaNegra(currentSession, jpegIzqBuf, jpegIzqLen);
+    currentSession++;
+    digitalWrite(LED_INDICATOR, HIGH);
+    if (altaCalidad) { s->set_framesize(s, FRAME_SIZE_STD); s->set_quality(s, JPEG_QUALITY_STD); }
+    return;
+  }
+
+  // ── 8. Guardar en LittleFS si se pide ───────────────────────
+  if (guardarEnFlash) {
+    guardarEnCajaNegra(currentSession, anaglifoBuf, anaglifoLen);
+  }
+
+  // ── 9. Transmitir anaglifo por ESP-NOW ──────────────────────
+  bool txOK = transmitirJPEG(IMG_ANAGLIFO, anaglifoBuf, anaglifoLen);
+  Serial.printf("[TX] Anaglifo %s (%u KB)\n",
+                txOK ? "enviado ✓" : "falló ✗",
+                anaglifoLen / 1024);
+
+  digitalWrite(LED_INDICATOR, HIGH);
+  currentSession++;
+
+  if (altaCalidad) {
+    s->set_framesize(s, FRAME_SIZE_STD);
+    s->set_quality(s, JPEG_QUALITY_STD);
+    delay(100);
+  }
+
+  delay(5000); // Cooldown entre capturas
+}
+
+// ══════════════════════════════════════════════════════════════
+// SETUP
+// ══════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_TRIGGER_STM32, INPUT_PULLDOWN);
+  pinMode(PIN_CHUTE_RELEASE, OUTPUT);
+  digitalWrite(PIN_CHUTE_RELEASE, LOW);
+  pinMode(LED_INDICATOR, OUTPUT);
+  digitalWrite(LED_INDICATOR, HIGH);
+
+  Serial1.setRxBufferSize(32768);
+  Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
+  // ── Asignar buffers en PSRAM ─────────────────────────────────
+  // 5 buffers × PSRAM: jpegIzq, jpegDer, rgbIzq, rgbDer, anaglif
+  jpegIzqBuf  = (uint8_t*)heap_caps_malloc(MAX_IMG_SIZE,  MALLOC_CAP_SPIRAM);
+  jpegDerBuf  = (uint8_t*)heap_caps_malloc(MAX_IMG_SIZE,  MALLOC_CAP_SPIRAM);
+  rgbIzqBuf   = (uint8_t*)heap_caps_malloc(RGB_BUF_SIZE,  MALLOC_CAP_SPIRAM);
+  rgbDerBuf   = (uint8_t*)heap_caps_malloc(RGB_BUF_SIZE,  MALLOC_CAP_SPIRAM);
+  anaglifoBuf = (uint8_t*)heap_caps_malloc(MAX_IMG_SIZE,  MALLOC_CAP_SPIRAM);
+
+  if (!jpegIzqBuf || !jpegDerBuf || !rgbIzqBuf || !rgbDerBuf || !anaglifoBuf) {
+    Serial.println("[FATAL] Sin PSRAM suficiente para buffers de imagen");
+    Serial.printf("[MEM]  PSRAM libre: %u KB\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+    while (true) delay(1000);
+  }
+
+  Serial.printf("[MEM] Buffers asignados. PSRAM libre restante: %u KB\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
+
+  if (!initCamera()) {
+    Serial.println("[FATAL] Cámara no inicializada");
+    while (true) delay(1000);
+  }
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+    delay(150);
+  }
+
+  initBlackBox();
+
+  if (!initEspNow()) {
+    Serial.println("[FATAL] ESP-NOW no inicializado");
+    while (true) delay(1000);
+  }
+
+  // Esperar READY de la Esclava
+  uint32_t t0 = millis();
+  while (millis() - t0 < 10000) {
+    if (Serial1.available() && Serial1.read() == READY_BYTE) {
+      slaveDormida = false;
+      Serial.println("[UART] Esclava lista");
+      break;
+    }
+    delay(50);
+  }
+
+  Serial.println("[MAESTRA] Sistema listo. Procesamiento de anaglifo a bordo activado.");
+}
+
+// ══════════════════════════════════════════════════════════════
+// LOOP
+// ══════════════════════════════════════════════════════════════
+void loop() {
+
+  // ── PRIORIDAD 1: Emergencia ───────────────────────────────
+  if (cmd_emergency) {
+    cmd_emergency = false;
+    Serial.println("[EMERGENCIA] Paracaídas + apagado total");
+    digitalWrite(PIN_CHUTE_RELEASE, HIGH);
+    delay(CHUTE_PULSE_MS);
+    digitalWrite(PIN_CHUTE_RELEASE, LOW);
+    dormirEsclavo();
+    delay(100);
+    Serial.flush();
+    esp_deep_sleep_start();
+  }
+
+  // ── PRIORIDAD 2: Dormir Esclava ───────────────────────────
+  if (cmd_sleep_slave) {
+    cmd_sleep_slave = false;
+    dormirEsclavo();
+  }
+
+  // ── Trigger físico STM32 ──────────────────────────────────
+  if (digitalRead(PIN_TRIGGER_STM32) == HIGH && !esperando_post_trigger) {
+    Serial.println("[TRIGGER] Disparo STM32 — anaglifo HQ + caja negra");
+    cicloAnaglifo(true, true);
+    t_trigger_stm32        = millis();
+    esperando_post_trigger = true;
+    cmd_captura_std = false;
+    cmd_captura_hq  = false;
+  }
+
+  // ── Temporizador post-trigger ─────────────────────────────
+  if (esperando_post_trigger) {
+    if (cmd_captura_std || cmd_captura_hq) t_trigger_stm32 = millis();
+    if (millis() - t_trigger_stm32 >= SLAVE_SLEEP_TIMEOUT_MS) {
+      esperando_post_trigger = false;
+      Serial.println("[PWR] 10s sin comando → durmiendo Esclava");
+      dormirEsclavo();
+    }
+  }
+
+  // ── Comandos RF ───────────────────────────────────────────
+  if (cmd_captura_std) {
+    cmd_captura_std = false;
+    Serial.println("[CMD F] Anaglifo SVGA");
+    cicloAnaglifo(false, false);
+  }
+  if (cmd_captura_hq) {
+    cmd_captura_hq = false;
+    Serial.println("[CMD M] Anaglifo XGA");
+    cicloAnaglifo(true, false);
+  }
+
+  // ── Heartbeat ─────────────────────────────────────────────
+  if (millis() - t_ultimo_latido >= 3000) {
+    t_ultimo_latido = millis();
+    enviarHeartbeat();
+  }
+
+  yield();
+}

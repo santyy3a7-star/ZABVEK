@@ -1,0 +1,494 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// BASE TERRENA — ESP32  v4.0  | Misión PEU 2026
+// Recepción de anaglifo 3D y guardado en tarjeta SD
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Cambio respecto a v3.0:
+//   Ya no es un puente USB→Python. Ahora la Base Terrena es autónoma:
+//   recibe el JPEG del anaglifo por ESP-NOW, lo ensambla en RAM,
+//   valida el CRC32 y lo guarda directamente en tarjeta SD.
+//   Sin depender de ningún script en PC.
+//
+// Hardware:
+//   ESP32 genérico + módulo SD SPI + LED en GPIO 2
+//
+//   Conexión SD (SPI):
+//     SD_CS   → GPIO  5  (ajusta si es necesario)
+//     SD_MOSI → GPIO 23
+//     SD_MISO → GPIO 19
+//     SD_CLK  → GPIO 18
+//
+// Formato de archivo guardado en SD:
+//   /PEU2026/Sesion_NNN_ANA.jpg   ← anaglifo rojo-cian
+//   /PEU2026/Sesion_NNN_HB.txt    ← log de heartbeats (RSSI + timestamp)
+//
+// Protocolo ESP-NOW recibido:
+//   Paquetes de 242 bytes con estructura EspNowPacket.
+//   Tipo PKT_IMG_START / PKT_IMG_CHUNK / PKT_IMG_END / PKT_HEARTBEAT.
+//   img_id = 0x00 para el anaglifo (imagen única por sesión).
+//
+// ─── Comandos enviados al CanSat (vía botones físicos opcionales) ────────────
+//   Para operación autónoma en campo sin PC: botones externos en GPIO 32-35
+//   Botón F (GPIO 32) → envía 0xFF → Captura SVGA
+//   Botón M (GPIO 33) → envía 0xFE → Captura XGA Alta Calidad
+//   Botón Z (GPIO 34) → envía 0xFD magic → Dormir Esclava
+//   Botón W (GPIO 35) → REQUIERE pulsación larga 3s → emergencia
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <SD.h>
+#include <SPI.h>
+
+// ─── Pines ────────────────────────────────────────────────────
+#define LED_PIN       2
+
+// SD SPI
+#define SD_CS_PIN     5
+#define SD_MOSI_PIN  23
+#define SD_MISO_PIN  19
+#define SD_CLK_PIN   18
+
+// Botones físicos opcionales (INPUT_PULLUP, activos en LOW)
+#define BTN_F_PIN    32
+#define BTN_M_PIN    33
+#define BTN_Z_PIN    34
+#define BTN_W_PIN    35
+#define BTN_W_HOLD_MS 3000   // Pulsación larga requerida para emergencia
+
+// ─── ESP-NOW ──────────────────────────────────────────────────
+#define ESPNOW_CHANNEL  1
+#define CHUNK_DATA_SIZE 230
+#define ESPNOW_MAGIC  0xC5A7
+
+// ─── MAC de la XIAO Maestra ───────────────────────────────────
+// ¡ACTUALIZA con la MAC real de tu XIAO Maestra!
+uint8_t CANSAT_MAC[] = {0xE0, 0x72, 0xA1, 0xFA, 0x14, 0xB4};
+
+// ─── Tipos de paquete ─────────────────────────────────────────
+#define PKT_IMG_START  0x01
+#define PKT_IMG_CHUNK  0x02
+#define PKT_IMG_END    0x03
+#define PKT_HEARTBEAT  0x04
+#define IMG_ANAGLIFO   0x00
+
+// ─── Payloads de comando ──────────────────────────────────────
+static const uint8_t CMD_STD[]   = {0xFF};
+static const uint8_t CMD_HQ[]    = {0xFE};
+static const uint8_t CMD_SLEEP[] = {0xFD, 0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x24};
+static const uint8_t CMD_CHUTE[] = {0xFC, 0xA5, 0x5A, 0xFF, 0x00, 0x13, 0x37};
+
+// ─── Paquete ESP-NOW ──────────────────────────────────────────
+#pragma pack(push, 1)
+struct EspNowPacket {
+  uint16_t magic;
+  uint8_t  type;
+  uint8_t  session;
+  uint8_t  img_id;
+  uint16_t chunk_idx;
+  uint16_t total_chunks;
+  uint8_t  data_len;
+  uint8_t  data[CHUNK_DATA_SIZE];
+  uint16_t crc16;
+};
+#pragma pack(pop)
+
+// ─── Buffer ensamblador de imagen en RAM ─────────────────────
+// La imagen JPEG más grande posible: ~300 KB (anaglifo XGA re-codificado)
+// El ESP32 base tiene 520 KB de SRAM, más 4 MB de PSRAM si la tiene.
+// Usamos malloc dinámico para el buffer de imagen y chunk-map estático.
+#define MAX_IMG_SIZE   (300UL * 1024)
+#define MAX_CHUNKS      ((MAX_IMG_SIZE + CHUNK_DATA_SIZE - 1) / CHUNK_DATA_SIZE)  // ~1305
+
+// Estado de la imagen en curso de recepción
+struct ImageSession {
+  uint8_t  sesion;
+  uint16_t total;
+  uint16_t recibidos;
+  uint32_t crc32_esp;
+  uint32_t len_esp;
+  // Mapa de chunks presentes (bitmap: 1 bit por chunk)
+  // MAX_CHUNKS = 1305 → bitmap = ceil(1305/8) = 164 bytes → OK en stack
+  uint8_t  chunkMask[MAX_CHUNKS / 8 + 1];
+  bool     activa;
+};
+
+static ImageSession imgSesion;
+static uint8_t*     imgBuffer = nullptr;   // Asignado en setup()
+
+// ─── Cola circular para paquetes recibidos en ISR ─────────────
+#define QUEUE_SIZE 64
+static EspNowPacket packetQueue[QUEUE_SIZE];
+static volatile int qHead = 0;
+static volatile int qTail = 0;
+
+// ─── Estadísticas ─────────────────────────────────────────────
+static uint32_t countHeartbeats  = 0;
+static uint32_t countImgGuardadas = 0;
+static uint32_t countChunksPerdidos = 0;
+static int8_t   ultimoRSSI       = 0;
+static bool     sdOK             = false;
+
+// ─── CRC helpers ─────────────────────────────────────────────
+uint16_t calcCRC16(const uint8_t* data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (int j = 0; j < 8; j++)
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+  }
+  return crc;
+}
+
+uint32_t calcCRC32(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc >> 1) ^ (0xEDB88320UL & (uint32_t)(-(int32_t)(crc & 1)));
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+// ─── Manejo del bitmap de chunks ─────────────────────────────
+void chunkSet(uint8_t* mask, uint16_t idx) {
+  mask[idx / 8] |=  (1 << (idx % 8));
+}
+bool chunkGet(const uint8_t* mask, uint16_t idx) {
+  return (mask[idx / 8] >> (idx % 8)) & 1;
+}
+
+// ─── Callback de recepción ESP-NOW (ISR context) ──────────────
+void onDataRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+  if (len != sizeof(EspNowPacket)) return;
+
+  uint16_t magic;
+  memcpy(&magic, data, 2);
+  if (magic != ESPNOW_MAGIC) return;
+
+  int nextHead = (qHead + 1) % QUEUE_SIZE;
+  if (nextHead == qTail) return;  // Cola llena
+
+  memcpy(&packetQueue[qHead], data, sizeof(EspNowPacket));
+
+  if (packetQueue[qHead].type == PKT_HEARTBEAT)
+    packetQueue[qHead].data[0] = (uint8_t)(int8_t)info->rx_ctrl->rssi;
+
+  qHead = nextHead;
+}
+
+// ─── Guardar imagen en SD ─────────────────────────────────────
+void guardarEnSD(uint8_t sesion, const uint8_t* data, uint32_t len) {
+  if (!sdOK || !data || len == 0) return;
+
+  char ruta[40];
+  snprintf(ruta, sizeof(ruta), "/PEU2026/Sesion_%03u_ANA.jpg", sesion);
+
+  File f = SD.open(ruta, FILE_WRITE);
+  if (!f) {
+    Serial.printf("[SD] Error abriendo %s\n", ruta);
+    // Intentar recrear el directorio
+    SD.mkdir("/PEU2026");
+    f = SD.open(ruta, FILE_WRITE);
+    if (!f) return;
+  }
+
+  // Escritura en bloques de 4 KB para no saturar el buffer SPI
+  uint32_t offset = 0;
+  while (offset < len) {
+    uint32_t blk = min((uint32_t)4096, len - offset);
+    f.write(data + offset, blk);
+    offset += blk;
+  }
+  f.close();
+
+  countImgGuardadas++;
+  Serial.printf("[SD ✓] %s (%u KB)\n", ruta, len / 1024);
+
+  // Parpadeo LED para confirmar guardado
+  for (int i = 0; i < 4; i++) {
+    digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(80);
+  }
+  digitalWrite(LED_PIN, LOW);
+}
+
+// ─── Guardar log de heartbeat en SD ──────────────────────────
+void logHeartbeat(uint8_t sesion, int8_t rssi) {
+  if (!sdOK) return;
+
+  char ruta[40];
+  snprintf(ruta, sizeof(ruta), "/PEU2026/Sesion_%03u_HB.txt", sesion);
+
+  // Abrir en modo append para acumular todos los heartbeats de la sesión
+  File f = SD.open(ruta, FILE_APPEND);
+  if (!f) return;
+
+  char linea[48];
+  snprintf(linea, sizeof(linea), "t=%lu rssi=%d dBm\n", millis(), (int)rssi);
+  f.print(linea);
+  f.close();
+}
+
+// ─── Procesar paquete individual ─────────────────────────────
+void procesarPaquete(const EspNowPacket& pkt) {
+  // Validar CRC16
+  uint16_t crcCalc = calcCRC16((uint8_t*)&pkt, sizeof(pkt) - sizeof(pkt.crc16));
+  if (crcCalc != pkt.crc16) {
+    Serial.printf("[CRC16] Paquete descartado (calc=%04X recv=%04X)\n",
+                  crcCalc, pkt.crc16);
+    return;
+  }
+
+  // ── Heartbeat ──────────────────────────────────────────────
+  if (pkt.type == PKT_HEARTBEAT) {
+    countHeartbeats++;
+    ultimoRSSI = (int8_t)pkt.data[0];
+    Serial.printf("[HB #%u] Sesión %u | RSSI: %d dBm\n",
+                  countHeartbeats, pkt.session, (int)ultimoRSSI);
+    logHeartbeat(pkt.session, ultimoRSSI);
+    return;
+  }
+
+  // Solo procesamos IMG_ANAGLIFO (img_id == 0)
+  if (pkt.img_id != IMG_ANAGLIFO) return;
+
+  // ── PKT_IMG_START ──────────────────────────────────────────
+  if (pkt.type == PKT_IMG_START) {
+    // Inicializar (o reiniciar) la sesión de recepción
+    uint32_t lenEsp, crc32Esp;
+    memcpy(&lenEsp,   pkt.data,     4);
+    memcpy(&crc32Esp, pkt.data + 4, 4);
+
+    imgSesion.sesion    = pkt.session;
+    imgSesion.total     = pkt.total_chunks;
+    imgSesion.recibidos = 0;
+    imgSesion.crc32_esp = crc32Esp;
+    imgSesion.len_esp   = lenEsp;
+    imgSesion.activa    = true;
+    memset(imgSesion.chunkMask, 0, sizeof(imgSesion.chunkMask));
+
+    digitalWrite(LED_PIN, HIGH);  // LED ON: recepción activa
+    Serial.printf("\n[RX] Anaglifo sesión %u | %.1f KB | %u chunks\n",
+                  pkt.session, lenEsp / 1024.0f, pkt.total_chunks);
+    return;
+  }
+
+  // Ignorar chunks sin START previo
+  if (!imgSesion.activa) return;
+  if (pkt.session != imgSesion.sesion) return;
+
+  // ── PKT_IMG_CHUNK ──────────────────────────────────────────
+  if (pkt.type == PKT_IMG_CHUNK) {
+    uint16_t idx = pkt.chunk_idx;
+    if (idx >= imgSesion.total) return;
+
+    uint32_t offset = (uint32_t)idx * CHUNK_DATA_SIZE;
+    if (offset + pkt.data_len > MAX_IMG_SIZE) return;
+
+    // Solo copiar si es un chunk nuevo (evitar duplicados de reintentos)
+    if (!chunkGet(imgSesion.chunkMask, idx)) {
+      memcpy(imgBuffer + offset, pkt.data, pkt.data_len);
+      chunkSet(imgSesion.chunkMask, idx);
+      imgSesion.recibidos++;
+
+      // Mostrar progreso cada 25 chunks
+      if (imgSesion.total > 0 && imgSesion.recibidos % 25 == 0) {
+        uint32_t pct = 100UL * imgSesion.recibidos / imgSesion.total;
+        Serial.printf("     %u/%u (%u%%)\n",
+                      imgSesion.recibidos, imgSesion.total, pct);
+      }
+    }
+    return;
+  }
+
+  // ── PKT_IMG_END ────────────────────────────────────────────
+  if (pkt.type == PKT_IMG_END) {
+    imgSesion.activa = false;
+    digitalWrite(LED_PIN, LOW);
+
+    // Verificar completitud
+    uint16_t faltantes = 0;
+    for (uint16_t i = 0; i < imgSesion.total; i++) {
+      if (!chunkGet(imgSesion.chunkMask, i)) faltantes++;
+    }
+
+    if (faltantes > 0) {
+      countChunksPerdidos += faltantes;
+      Serial.printf("[INCOMPLETO] Sesión %u: %u/%u chunks. Faltan: %u\n",
+                    pkt.session, imgSesion.recibidos, imgSesion.total, faltantes);
+      return;
+    }
+
+    // Calcular CRC32 del buffer ensamblado
+    uint32_t crcCalc32 = calcCRC32(imgBuffer, imgSesion.len_esp);
+    if (crcCalc32 != imgSesion.crc32_esp) {
+      Serial.printf("[CRC32] Fallo sesión %u: esperado=%08X calculado=%08X\n",
+                    pkt.session, imgSesion.crc32_esp, crcCalc32);
+      return;
+    }
+
+    // Imagen válida → guardar en SD
+    Serial.printf("[RX ✓] Sesión %u completa (%u KB, CRC32 OK)\n",
+                  pkt.session, imgSesion.len_esp / 1024);
+    guardarEnSD(pkt.session, imgBuffer, imgSesion.len_esp);
+  }
+}
+
+// ─── Enviar comando al CanSat ─────────────────────────────────
+void enviarComando(const uint8_t* payload, size_t len) {
+  esp_now_send(CANSAT_MAC, payload, len);
+  Serial.printf("[CMD] Enviado (%u bytes) al CanSat\n", (unsigned)len);
+}
+
+// ─── Leer botones físicos ─────────────────────────────────────
+// Debounce simple: lectura cada 50ms en el loop principal.
+// Botón W requiere pulsación larga de BTN_W_HOLD_MS.
+static bool     btnWActivo    = false;
+static uint32_t btnWt0        = 0;
+static bool     btnWDisparado = false;
+
+void leerBotones() {
+  // Botón F (captura SVGA)
+  if (digitalRead(BTN_F_PIN) == LOW) {
+    delay(50);
+    if (digitalRead(BTN_F_PIN) == LOW) {
+      enviarComando(CMD_STD, 1);
+      while (digitalRead(BTN_F_PIN) == LOW) delay(10);
+    }
+  }
+
+  // Botón M (captura HQ)
+  if (digitalRead(BTN_M_PIN) == LOW) {
+    delay(50);
+    if (digitalRead(BTN_M_PIN) == LOW) {
+      enviarComando(CMD_HQ, 1);
+      while (digitalRead(BTN_M_PIN) == LOW) delay(10);
+    }
+  }
+
+  // Botón Z (dormir Esclava)
+  if (digitalRead(BTN_Z_PIN) == LOW) {
+    delay(50);
+    if (digitalRead(BTN_Z_PIN) == LOW) {
+      enviarComando(CMD_SLEEP, sizeof(CMD_SLEEP));
+      while (digitalRead(BTN_Z_PIN) == LOW) delay(10);
+    }
+  }
+
+  // Botón W (emergencia — pulsación larga)
+  bool wPulsado = (digitalRead(BTN_W_PIN) == LOW);
+  if (wPulsado && !btnWActivo) {
+    btnWActivo    = true;
+    btnWt0        = millis();
+    btnWDisparado = false;
+  } else if (!wPulsado && btnWActivo) {
+    btnWActivo = false;
+    btnWDisparado = false;
+  } else if (wPulsado && btnWActivo && !btnWDisparado) {
+    if (millis() - btnWt0 >= BTN_W_HOLD_MS) {
+      btnWDisparado = true;
+      enviarComando(CMD_CHUTE, sizeof(CMD_CHUTE));
+      Serial.println("[EMERGENCIA] Comando de paracaídas enviado");
+      // Parpadeo rápido como confirmación visual
+      for (int i = 0; i < 10; i++) {
+        digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(60);
+      }
+    }
+  }
+}
+
+// ─── Setup ────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // Botones con pull-up interno
+  pinMode(BTN_F_PIN, INPUT_PULLUP);
+  pinMode(BTN_M_PIN, INPUT_PULLUP);
+  pinMode(BTN_Z_PIN, INPUT_PULLUP);
+  pinMode(BTN_W_PIN, INPUT_PULLUP);
+
+  // ── Buffer de imagen en heap ──────────────────────────────
+  // Si el ESP32 tiene PSRAM, usarla. Si no, usar SRAM (puede no caber).
+  imgBuffer = (uint8_t*)heap_caps_malloc(MAX_IMG_SIZE, MALLOC_CAP_SPIRAM);
+  if (!imgBuffer) {
+    Serial.println("[WARN] Sin PSRAM — usando SRAM para buffer de imagen");
+    imgBuffer = (uint8_t*)malloc(MAX_IMG_SIZE);
+  }
+  if (!imgBuffer) {
+    Serial.println("[FATAL] Sin memoria para buffer de imagen");
+    while (true) delay(1000);
+  }
+
+  // ── SD ────────────────────────────────────────────────────
+  SPI.begin(SD_CLK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  if (SD.begin(SD_CS_PIN)) {
+    sdOK = true;
+    // Crear directorio de misión
+    if (!SD.exists("/PEU2026")) SD.mkdir("/PEU2026");
+    uint64_t totalMB = SD.totalBytes() / (1024UL * 1024UL);
+    uint64_t usadoMB = SD.usedBytes()  / (1024UL * 1024UL);
+    Serial.printf("[SD] OK — %llu MB total, %llu MB usados\n", totalMB, usadoMB);
+    // Guardar log de inicio
+    File log = SD.open("/PEU2026/INICIO.txt", FILE_APPEND);
+    if (log) {
+      log.printf("PEU2026 Base Terrena v4.0 — arranque t=%lu ms\n", millis());
+      log.close();
+    }
+  } else {
+    sdOK = false;
+    Serial.println("[WARN] SD no disponible — solo log por Serial");
+  }
+
+  // ── ESP-NOW ───────────────────────────────────────────────
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[FATAL] ESP-NOW no inicializado");
+    while (true) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(200); }
+  }
+  esp_now_register_recv_cb(onDataRecv);
+
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, CANSAT_MAC, 6);
+  peer.channel = ESPNOW_CHANNEL;
+  peer.encrypt  = false;
+  esp_now_add_peer(&peer);
+
+  // 3 parpadeos: sistema listo
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(LED_PIN, HIGH); delay(150);
+    digitalWrite(LED_PIN, LOW);  delay(150);
+  }
+
+  Serial.println("[BASE] Sistema listo. Esperando anaglifo del CanSat.");
+}
+
+// ─── Loop ─────────────────────────────────────────────────────
+void loop() {
+  // ── Vaciar cola de paquetes recibidos ─────────────────────
+  while (qHead != qTail) {
+    procesarPaquete(packetQueue[qTail]);
+    qTail = (qTail + 1) % QUEUE_SIZE;
+  }
+
+  // ── Leer botones físicos ──────────────────────────────────
+  leerBotones();
+
+  // ── Log periódico por Serial (cada 10s) ───────────────────
+  static uint32_t tLogAnterior = 0;
+  if (millis() - tLogAnterior >= 10000) {
+    tLogAnterior = millis();
+    Serial.printf("[ESTADO] HB:%u | Fotos:%u | Perdidos:%u | RSSI:%d dBm | SD:%s\n",
+                  countHeartbeats, countImgGuardadas, countChunksPerdidos,
+                  (int)ultimoRSSI, sdOK ? "OK" : "NO");
+  }
+}

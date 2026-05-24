@@ -1,0 +1,179 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// XIAO ESCLAVA (Derecha) — v6.0 | Misión PEU 2026
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Rol: Capturar la imagen derecha del par estéreo y enviarla a la Maestra
+//      por UART con encuadre + CRC32. Sin cambios lógicos respecto a v5.2.
+//
+// Protocolo UART de salida:
+//   FRAME_START(4B) + len(4B) + JPEG(len B) + CRC32(4B) + FRAME_END(4B)
+//
+// Comandos recibidos:
+//   0x53 → captura SVGA Q15
+//   0x54 → captura XGA  Q10
+//   0x55 → esp_deep_sleep_start()
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include "esp_camera.h"
+#include "esp_heap_caps.h"
+
+// ─── Pines ────────────────────────────────────────────────────
+#define LED_INDICATOR  21
+#define UART_TX_PIN    43
+#define UART_RX_PIN    44
+#define UART_BAUD      921600
+
+// ─── Resolución ───────────────────────────────────────────────
+#define JPEG_QUALITY_STD  15
+#define FRAME_SIZE_STD    FRAMESIZE_SVGA
+#define JPEG_QUALITY_HQ   10
+#define FRAME_SIZE_HQ     FRAMESIZE_XGA
+
+// ─── Cámara (XIAO ESP32-S3 Sense) ────────────────────────────
+#define PWDN_GPIO_NUM   -1
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM   10
+#define SIOD_GPIO_NUM   40
+#define SIOC_GPIO_NUM   39
+#define Y9_GPIO_NUM     48
+#define Y8_GPIO_NUM     11
+#define Y7_GPIO_NUM     12
+#define Y6_GPIO_NUM     14
+#define Y5_GPIO_NUM     16
+#define Y4_GPIO_NUM     18
+#define Y3_GPIO_NUM     17
+#define Y2_GPIO_NUM     15
+#define VSYNC_GPIO_NUM  38
+#define HREF_GPIO_NUM   47
+#define PCLK_GPIO_NUM   13
+
+// ─── Protocolo UART ───────────────────────────────────────────
+static const uint8_t FRAME_START[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+static const uint8_t FRAME_END[4]   = {0xDD, 0xCC, 0xBB, 0xAA};
+#define SYNC_BYTE_STD   0x53
+#define SYNC_BYTE_HQ    0x54
+#define SYNC_BYTE_SLEEP 0x55
+#define READY_BYTE      0x52
+
+// ─── CRC32 ────────────────────────────────────────────────────
+uint32_t calcCRC32(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int j = 0; j < 8; j++)
+      crc = (crc >> 1) ^ (0xEDB88320UL & (uint32_t)(-(int32_t)(crc & 1)));
+  }
+  return crc ^ 0xFFFFFFFF;
+}
+
+// ─── Inicialización de cámara ─────────────────────────────────
+bool initCamera() {
+  camera_config_t cfg;
+  cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer  = LEDC_TIMER_0;
+  cfg.pin_d0 = Y2_GPIO_NUM; cfg.pin_d1 = Y3_GPIO_NUM;
+  cfg.pin_d2 = Y4_GPIO_NUM; cfg.pin_d3 = Y5_GPIO_NUM;
+  cfg.pin_d4 = Y6_GPIO_NUM; cfg.pin_d5 = Y7_GPIO_NUM;
+  cfg.pin_d6 = Y8_GPIO_NUM; cfg.pin_d7 = Y9_GPIO_NUM;
+  cfg.pin_xclk     = XCLK_GPIO_NUM;  cfg.pin_pclk    = PCLK_GPIO_NUM;
+  cfg.pin_vsync    = VSYNC_GPIO_NUM; cfg.pin_href    = HREF_GPIO_NUM;
+  cfg.pin_sscb_sda = SIOD_GPIO_NUM;  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
+  cfg.pin_pwdn     = PWDN_GPIO_NUM;  cfg.pin_reset   = RESET_GPIO_NUM;
+  cfg.xclk_freq_hz = 10000000;
+  cfg.pixel_format = PIXFORMAT_JPEG;
+  cfg.frame_size   = FRAME_SIZE_STD;
+  cfg.jpeg_quality = JPEG_QUALITY_STD;
+  cfg.fb_count     = 1;
+  cfg.fb_location  = CAMERA_FB_IN_PSRAM;
+  cfg.grab_mode    = CAMERA_GRAB_LATEST;
+  return esp_camera_init(&cfg) == ESP_OK;
+}
+
+// ─── Setup ────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_INDICATOR, OUTPUT);
+  digitalWrite(LED_INDICATOR, HIGH);
+
+  Serial1.setRxBufferSize(2048);
+  Serial1.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
+  if (!initCamera()) {
+    Serial.println("[FATAL] Cámara no inicializada");
+    while (true) delay(1000);
+  }
+
+  // Descartar frames de estabilización
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+    delay(100);
+  }
+
+  // Señalizar que estamos listos
+  Serial1.write(READY_BYTE);
+  Serial1.flush();
+  Serial.println("[ESCLAVA] Lista — esperando sincronía de la Maestra");
+}
+
+// ─── Loop ─────────────────────────────────────────────────────
+void loop() {
+  if (!Serial1.available()) { yield(); return; }
+
+  uint8_t cmd = Serial1.read();
+
+  // ── Orden de apagado ──────────────────────────────────────
+  if (cmd == SYNC_BYTE_SLEEP) {
+    Serial.println("[PWR] Entrando en deep sleep por orden de la Maestra");
+    Serial.flush();
+    esp_deep_sleep_start();
+    // No retorna
+  }
+
+  // ── Orden de captura ──────────────────────────────────────
+  if (cmd == SYNC_BYTE_STD || cmd == SYNC_BYTE_HQ) {
+    digitalWrite(LED_INDICATOR, LOW);
+
+    bool altaCalidad = (cmd == SYNC_BYTE_HQ);
+    sensor_t* s = esp_camera_sensor_get();
+
+    if (altaCalidad) {
+      s->set_framesize(s, FRAME_SIZE_HQ);
+      s->set_quality(s, JPEG_QUALITY_HQ);
+      delay(250);
+    }
+
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) {
+      digitalWrite(LED_INDICATOR, HIGH);
+      if (altaCalidad) {
+        s->set_framesize(s, FRAME_SIZE_STD);
+        s->set_quality(s, JPEG_QUALITY_STD);
+      }
+      return;
+    }
+
+    // Calcular CRC32 y enviar frame encapsulado
+    uint32_t crc32  = calcCRC32(fb->buf, fb->len);
+    uint32_t imgLen = fb->len;
+
+    Serial1.write(FRAME_START, 4);
+    Serial1.write((uint8_t*)&imgLen, 4);
+    Serial1.write(fb->buf, fb->len);
+    Serial1.write((uint8_t*)&crc32, 4);
+    Serial1.write(FRAME_END, 4);
+    Serial1.flush();
+
+    esp_camera_fb_return(fb);
+
+    if (altaCalidad) {
+      s->set_framesize(s, FRAME_SIZE_STD);
+      s->set_quality(s, JPEG_QUALITY_STD);
+      delay(100);
+    }
+
+    digitalWrite(LED_INDICATOR, HIGH);
+  }
+
+  yield();
+}
