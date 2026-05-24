@@ -7,23 +7,31 @@
   * Módulo LoRa : Reyax RYLR998 en USART1 (PA9=TX, PA10=RX) a 115200 baud
   * Sensores    : BNO085 (I2C1, 0x4B) + BMP390 (I2C1, 0x76 o 0x77 auto-detectado)
   * LED debug   : PC13 (activo bajo)
-  * MOSFET      : PA6  (activo alto)
+  * MOSFET      : PB1  (activo alto)
   *
   * ┌──────────────────────────────────────────────────────────────────┐
-  * │  PARÁMETRO CLAVE — CAMBIA ANTES DE CADA PRUEBA:                 │
-  * │   #define ENABLE_NICROM_BURN  1  → competencia: quema real      │
-  * │   #define ENABLE_NICROM_BURN  0  → prueba: solo envía LoRa      │
+  * │  PARÁMETRO CLAVE — CAMBIA ANTES DE CADA PRUEBA:                  │
+  * │   #define ENABLE_NICROM_BURN  1  → competencia: quema real       │
+  * │   #define ENABLE_NICROM_BURN  0  → prueba: solo envía LoRa       │
   * └──────────────────────────────────────────────────────────────────┘
   *
   * CONFIGURACIÓN LORA:
-  *   Banda: 915 MHz  |  SF7, BW=125 kHz, CR=4/5, Preamble=12
-  *   NETWORKID=5  |  STM32 ADDR=1  |  ESP32 ADDR=2
+  * Banda: 915 MHz  |  SF7, BW=125 kHz, CR=4/5, Preamble=12
+  * NETWORKID=5  |  STM32 ADDR=1  |  ESP32 ADDR=2
   *
   * PAYLOAD TELEMETRÍA (16 campos CSV):
-  *   PKT,Ax,Ay,Az,At,Vx,Vy,Vz,Vt,Yaw,Pitch,Roll,Temp,Press,Alt,Released
+  * PKT,Ax,Ay,Az,At,Vx,Vy,Vz,Vt,Yaw,Pitch,Roll,Temp,Press,Alt,Released
   *
   * PAYLOAD EVENTO NICROM:
-  *   NICROM_ACTIVADO,Alt=<m>,Apogeo=<m>,Burn=<0|1>
+  * NICROM_ACTIVADO,Alt=<m>,Apogeo=<m>,Burn=<0|1>
+  *
+  * PAYLOAD TRIGGER FOTO:
+  * FOTO_TRIGGER,Alt=<m>,Conf=<n>
+  *
+  * PINES ASIGNADOS (XIAO y MOSFET):
+  * PB1 — Salida: MOSFET para hilo de nicromo (activo alto)
+  * PB0 — Salida: pulso trigger cámara hacia XIAO Maestra (activo alto, 100 ms)
+  * PB3 — Entrada: pulso de emergencia desde XIAO Maestra (activo alto)
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -51,16 +59,29 @@
 #define LORA_ACK_WAIT_MS       350u
 #define EMA_ALPHA              0.2f
 
-/* ── MOSFET / nicrom ───────────────────────────────────────────────── */
+/* ── MOSFET / nicrom (PB1) ─────────────────────────────────────────── */
 #define ENABLE_NICROM_BURN     1           /* 1=competencia | 0=prueba        */
-#define MOSFET_GPIO_PORT       GPIOA
-#define MOSFET_GPIO_PIN        GPIO_PIN_6
+#define MOSFET_GPIO_PORT       GPIOB
+#define MOSFET_GPIO_PIN        GPIO_PIN_1
 #define BURN_TIME_MS           3000u
 
-/* ── Lógica de descenso ────────────────────────────────────────────── */
+/* ── Lógica de descenso (liberación autogiro) ──────────────────────── */
 #define DESCENT_THRESHOLD_M    5.0f
 #define REQUIRED_CONFIRMATIONS 5
 #define ALT_CHECK_INTERVAL_MS  200u
+
+/* ── Trigger fotográfico (PB0 → XIAO Maestra) ─────────────────────── */
+#define PHOTO_TRIGGER_PORT     GPIOB
+#define PHOTO_TRIGGER_PIN      GPIO_PIN_0
+#define PHOTO_TRIGGER_PULSE_MS 100u        /* duración del pulso de trigger   */
+#define PHOTO_ALT_RANGE_M      4.0f        /* ventana de estabilidad ±4 m     */
+#define PHOTO_ALT_SAMPLES      8           /* muestras dentro del rango       */
+#define PHOTO_ALT_INTERVAL_MS  150u        /* cadencia de muestreo (ms)       */
+#define PHOTO_MIN_ALT_M        20.0f       /* ignorar bajo 20 m (despegue)    */
+
+/* ── Canal de emergencia desde XIAO (PB3 → STM32) ────────────────── */
+#define EMERGENCY_IN_PORT      GPIOB
+#define EMERGENCY_IN_PIN       GPIO_PIN_3
 
 /* USER CODE END PD */
 
@@ -80,12 +101,7 @@ volatile uint32_t g_t_prev = 0;
 /* ── BMP390 ────────────────────────────────────────────────────────── */
 static struct bmp3_dev  bmp;
 static struct bmp3_data bmp_data;
-/*
- *  bmp_addr se rellena dinámicamente en main() tras el i2c_probe().
- *  Arranca en 0; si el probe falla, g_bmp_ok quedará != BMP3_OK
- *  y nunca se leerá presión (fail-safe idéntico al código anterior).
- */
-static uint8_t  bmp_addr = 0;   /* 8 bits: (addr_7bit << 1)                  */
+static uint8_t  bmp_addr = 0;
 volatile float  g_temp   = 0, g_press = 0;
 volatile int8_t g_bmp_ok = -1;
 
@@ -97,6 +113,12 @@ static int     g_conf_count   = 0;
 static uint8_t g_release_done = 0;
 
 volatile uint32_t g_pkt = 0;
+
+/* ── Trigger fotográfico ───────────────────────────────────────────── */
+static float    g_photo_ref_alt   = 0.0f;  /* altitud de referencia actual   */
+static int      g_photo_conf      = 0;     /* muestras consecutivas en rango */
+static uint8_t  g_photo_triggered = 0;     /* 1 = ya se disparó el trigger   */
+static uint32_t g_last_photo_chk  = 0;     /* timestamp último chequeo       */
 
 /* USER CODE END PV */
 
@@ -257,99 +279,119 @@ int main(void)
     HAL_Init();
     SystemClock_Config();
     MX_GPIO_Init();
-    MX_I2C1_Init();          /* I2C primero — igual que en el código que funcionó */
+    MX_I2C1_Init();
     MX_USART1_UART_Init();
     MX_USART2_UART_Init();
 
     /* USER CODE BEGIN 2 */
 
-        /* ── 0. MOSFET GPIO ────────────────────────────────────────────── */
-        {
-            GPIO_InitTypeDef gm = {0};
-            gm.Pin   = MOSFET_GPIO_PIN;
-            gm.Mode  = GPIO_MODE_OUTPUT_PP;
-            gm.Pull  = GPIO_NOPULL;
-            gm.Speed = GPIO_SPEED_FREQ_LOW;
-            __HAL_RCC_GPIOA_CLK_ENABLE();
-            HAL_GPIO_Init(MOSFET_GPIO_PORT, &gm);
-            HAL_GPIO_WritePin(MOSFET_GPIO_PORT, MOSFET_GPIO_PIN, GPIO_PIN_RESET);
+    /* Habilitar reloj del Puerto B para MOSFET, Cámara y Emergencia */
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    /* ── 0a. MOSFET GPIO (PB1) ─────────────────────────────────────── */
+    {
+        GPIO_InitTypeDef gm = {0};
+        gm.Pin   = MOSFET_GPIO_PIN;
+        gm.Mode  = GPIO_MODE_OUTPUT_PP;
+        gm.Pull  = GPIO_NOPULL;
+        gm.Speed = GPIO_SPEED_FREQ_LOW;
+        HAL_GPIO_Init(MOSFET_GPIO_PORT, &gm);
+        HAL_GPIO_WritePin(MOSFET_GPIO_PORT, MOSFET_GPIO_PIN, GPIO_PIN_RESET);
+    }
+
+    /* ── 0b. PB0 (trigger foto → XIAO) y PB3 (emergencia ← XIAO) ─── */
+    {
+        GPIO_InitTypeDef gp = {0};
+
+        /* PB0: salida — pulso trigger cámara hacia XIAO Maestra */
+        gp.Pin   = PHOTO_TRIGGER_PIN;
+        gp.Mode  = GPIO_MODE_OUTPUT_PP;
+        gp.Pull  = GPIO_NOPULL;
+        gp.Speed = GPIO_SPEED_FREQ_LOW;
+        HAL_GPIO_Init(PHOTO_TRIGGER_PORT, &gp);
+        HAL_GPIO_WritePin(PHOTO_TRIGGER_PORT, PHOTO_TRIGGER_PIN, GPIO_PIN_RESET);
+
+        /* PB3: entrada — recibe pulso de emergencia desde XIAO Maestra */
+        gp.Pin  = EMERGENCY_IN_PIN;
+        gp.Mode = GPIO_MODE_INPUT;
+        gp.Pull = GPIO_PULLDOWN;
+        HAL_GPIO_Init(EMERGENCY_IN_PORT, &gp);
+    }
+
+    /* ── 1. LIMPIEZA DE BUS I2C (Reinicio del BNO085) ─────────────── */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
+    HAL_Delay(10);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
+    HAL_Delay(300);
+
+    /* ── 2. BMP390 — auto-detección de dirección ───────────────────── */
+    if (i2c_probe(0x76)) {
+        bmp_addr = 0x76 << 1;
+    } else if (i2c_probe(0x77)) {
+        bmp_addr = 0x77 << 1;
+    }
+
+    bmp.intf     = BMP3_I2C_INTF;
+    bmp.read     = bmp_read;
+    bmp.write    = bmp_write;
+    bmp.delay_us = bmp_delay;
+    bmp.intf_ptr = &bmp_addr;
+    g_bmp_ok     = bmp3_init(&bmp);
+
+    if (g_bmp_ok == BMP3_OK) {
+        struct bmp3_settings s = {0};
+        s.press_en            = BMP3_ENABLE;
+        s.temp_en             = BMP3_ENABLE;
+        s.odr_filter.press_os = BMP3_OVERSAMPLING_8X;
+        s.odr_filter.temp_os  = BMP3_OVERSAMPLING_2X;
+        s.odr_filter.odr      = BMP3_ODR_12_5_HZ;
+        bmp3_set_sensor_settings(BMP3_SEL_PRESS_EN | BMP3_SEL_TEMP_EN |
+                                 BMP3_SEL_PRESS_OS | BMP3_SEL_TEMP_OS |
+                                 BMP3_SEL_ODR, &s, &bmp);
+        s.op_mode = BMP3_MODE_NORMAL;
+        bmp3_set_op_mode(&s, &bmp);
+    }
+
+    /* ── 3. BNO085 — Inicialización de librería ────────────────────── */
+    sh2Hal.open      = sh2hal_open;
+    sh2Hal.close     = sh2hal_close;
+    sh2Hal.read      = sh2hal_read;
+    sh2Hal.write     = sh2hal_write;
+    sh2Hal.getTimeUs = sh2hal_getUs;
+
+    if (sh2_open(&sh2Hal, NULL, NULL) == 0) {
+        sh2_setSensorCallback(sensor_cb, NULL);
+        sh2_SensorConfig_t cfg = {0};
+        cfg.reportInterval_us = 50000;   /* 20 Hz */
+        sh2_setSensorConfig(SH2_LINEAR_ACCELERATION, &cfg);
+        sh2_setSensorConfig(SH2_ROTATION_VECTOR,     &cfg);
+    }
+
+    /* ── 4. Calibración de presión base (referencia suelo = 0 m) ───── */
+    if (g_bmp_ok == BMP3_OK) {
+        HAL_Delay(500);
+        float sum = 0.0f;
+        for (int i = 0; i < 10; i++) {
+            bmp3_get_sensor_data(BMP3_PRESS | BMP3_TEMP, &bmp_data, &bmp);
+            sum += (float)(bmp_data.pressure / 100.0);
+            HAL_Delay(150);
         }
+        g_baseline_hpa = sum / 10.0f;
+    }
 
-        /* ── 1. LIMPIEZA DE BUS I2C (Reinicio del BNO085) ──────────────── */
-        /* Hacemos esto PRIMERO para asegurar que el bus I2C esté libre     */
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
-        HAL_Delay(10);
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
-        HAL_Delay(300);
+    /* ── 5. RYLR998 — configuración ────────────────────────────────── */
+    HAL_Delay(1000);
+    lora_cmd("AT\r\n",                     500);
+    lora_cmd("AT+BAND=915000000\r\n",      500);
+    lora_cmd("AT+PARAMETER=7,7,1,12\r\n", 500);
+    lora_cmd("AT+ADDRESS=1\r\n",           500);
+    lora_cmd("AT+NETWORKID=5\r\n",         500);
+    { uint8_t d; while (HAL_UART_Receive(&huart1, &d, 1, 5) == HAL_OK) {} }
 
-        /* ── 2. BMP390 — auto-detección de dirección ───────────────────── */
-        if (i2c_probe(0x76)) {
-            bmp_addr = 0x76 << 1;
-        } else if (i2c_probe(0x77)) {
-            bmp_addr = 0x77 << 1;
-        }
+    uint32_t last_tx      = HAL_GetTick();
+    uint32_t last_alt_chk = HAL_GetTick();
 
-        bmp.intf     = BMP3_I2C_INTF;
-        bmp.read     = bmp_read;
-        bmp.write    = bmp_write;
-        bmp.delay_us = bmp_delay;
-        bmp.intf_ptr = &bmp_addr;
-        g_bmp_ok     = bmp3_init(&bmp);
-
-        if (g_bmp_ok == BMP3_OK) {
-            struct bmp3_settings s = {0};
-            s.press_en            = BMP3_ENABLE;
-            s.temp_en             = BMP3_ENABLE;
-            s.odr_filter.press_os = BMP3_OVERSAMPLING_8X;
-            s.odr_filter.temp_os  = BMP3_OVERSAMPLING_2X;
-            s.odr_filter.odr      = BMP3_ODR_12_5_HZ;
-            bmp3_set_sensor_settings(BMP3_SEL_PRESS_EN | BMP3_SEL_TEMP_EN |
-                                     BMP3_SEL_PRESS_OS | BMP3_SEL_TEMP_OS |
-                                     BMP3_SEL_ODR, &s, &bmp);
-            s.op_mode = BMP3_MODE_NORMAL;
-            bmp3_set_op_mode(&s, &bmp);
-        }
-
-        /* ── 3. BNO085 — Inicialización de librería ────────────────────── */
-        sh2Hal.open      = sh2hal_open;
-        sh2Hal.close     = sh2hal_close;
-        sh2Hal.read      = sh2hal_read;
-        sh2Hal.write     = sh2hal_write;
-        sh2Hal.getTimeUs = sh2hal_getUs;
-
-        if (sh2_open(&sh2Hal, NULL, NULL) == 0) {
-            sh2_setSensorCallback(sensor_cb, NULL);
-            sh2_SensorConfig_t cfg = {0};
-            cfg.reportInterval_us = 50000;   /* 20 Hz */
-            sh2_setSensorConfig(SH2_LINEAR_ACCELERATION, &cfg);
-            sh2_setSensorConfig(SH2_ROTATION_VECTOR,     &cfg);
-        }
-
-        /* ── 4. Calibración de presión base (referencia suelo = 0 m) ───── */
-        if (g_bmp_ok == BMP3_OK) {
-            HAL_Delay(500);
-            float sum = 0.0f;
-            for (int i = 0; i < 10; i++) {
-                bmp3_get_sensor_data(BMP3_PRESS | BMP3_TEMP, &bmp_data, &bmp);
-                sum += (float)(bmp_data.pressure / 100.0);
-                HAL_Delay(150);
-            }
-            g_baseline_hpa = sum / 10.0f;
-        }
-
-        /* ── 5. RYLR998 — configuración ────────────────────────────────── */
-        HAL_Delay(1000);
-        lora_cmd("AT\r\n",                     500);
-        lora_cmd("AT+BAND=915000000\r\n",      500);
-        lora_cmd("AT+PARAMETER=7,7,1,12\r\n", 500);
-        lora_cmd("AT+ADDRESS=1\r\n",           500);
-        lora_cmd("AT+NETWORKID=5\r\n",         500);
-        { uint8_t d; while (HAL_UART_Receive(&huart1, &d, 1, 5) == HAL_OK) {} }
-
-        uint32_t last_tx      = HAL_GetTick();
-        uint32_t last_alt_chk = HAL_GetTick();
-
-        /* USER CODE END 2 */
+    /* USER CODE END 2 */
 
     /* ══════════════════════════════════════════════════════════════════
        LOOP PRINCIPAL
@@ -369,6 +411,7 @@ int main(void)
             g_press    = (float)(bmp_data.pressure / 100.0);
             g_altitude = pressure_to_altitude(g_press, g_baseline_hpa);
 
+            /* ── Liberación barométrica ──────────────────────────────── */
             if (!g_release_done)
             {
                 if (g_altitude > g_max_altitude)
@@ -379,11 +422,72 @@ int main(void)
                 else
                     if (g_conf_count > 0) g_conf_count--;
 
-                if (g_conf_count >= REQUIRED_CONFIRMATIONS) {
+                if (g_conf_count >= REQUIRED_CONFIRMATIONS &&
+                    g_max_altitude >= 150.0f)
+                {
                     g_release_done = 1;
                     activate_release(g_altitude, g_max_altitude);
                 }
             }
+        }
+
+        /* ── A2. Trigger fotográfico PB0 (UN SOLO DISPARO) ───────────── *
+         * - Activa por encima de 20 m.                                  *
+         * - Toma una sola foto si se mantiene estable (±4m) por 1.2s.   *
+         * - Se bloquea con g_photo_triggered para no saturar memoria.   *
+         * ────────────────────────────────────────────────────────────── */
+        if (!g_photo_triggered && g_bmp_ok == BMP3_OK &&
+            g_altitude > PHOTO_MIN_ALT_M &&
+            (now - g_last_photo_chk) >= PHOTO_ALT_INTERVAL_MS)
+        {
+            g_last_photo_chk = now;
+
+            if (g_photo_conf == 0) {
+                /* Primera muestra válida: establecer referencia */
+                g_photo_ref_alt = g_altitude;
+                g_photo_conf    = 1;
+            } else {
+                if (fabsf(g_altitude - g_photo_ref_alt) <= PHOTO_ALT_RANGE_M) {
+                    /* Dentro del rango: acumular confirmación */
+                    g_photo_conf++;
+                } else {
+                    /* Fuera de rango: nueva referencia, reiniciar contador */
+                    g_photo_ref_alt = g_altitude;
+                    g_photo_conf    = 1;
+                }
+            }
+
+            if (g_photo_conf >= PHOTO_ALT_SAMPLES)
+            {
+                /* BLOQUEO PERMANENTE: Ya no volverá a entrar a esta rutina */
+                g_photo_triggered = 1;
+
+                /* Pulso de trigger hacia XIAO Maestra por PB0 */
+                HAL_GPIO_WritePin(PHOTO_TRIGGER_PORT, PHOTO_TRIGGER_PIN, GPIO_PIN_SET);
+                HAL_Delay(PHOTO_TRIGGER_PULSE_MS);
+                HAL_GPIO_WritePin(PHOTO_TRIGGER_PORT, PHOTO_TRIGGER_PIN, GPIO_PIN_RESET);
+
+                /* Notificar evento por LoRa */
+                char pay[64], cmd_lora[96];
+                snprintf(pay, sizeof(pay),
+                         "FOTO_TRIGGER,Alt=%.1f,Conf=%d",
+                         g_altitude, g_photo_conf);
+                snprintf(cmd_lora, sizeof(cmd_lora),
+                         "AT+SEND=2,%d,%s\r\n", (int)strlen(pay), pay);
+                lora_cmd(cmd_lora, LORA_ACK_WAIT_MS);
+            }
+        }
+
+        /* ── A3. Emergencia desde XIAO Maestra (PB3) ────────────────── *
+         * Si la XIAO recibe comando 'W' desde la base terrena, emite   *
+         * un pulso HIGH en PB3. El STM32 lo detecta aquí y activa el   *
+         * nicromo como canal de emergencia independiente al barómetro. *
+         * ────────────────────────────────────────────────────────────── */
+        if (!g_release_done &&
+            HAL_GPIO_ReadPin(EMERGENCY_IN_PORT, EMERGENCY_IN_PIN) == GPIO_PIN_SET)
+        {
+            g_release_done = 1;
+            activate_release(g_altitude, g_max_altitude);
         }
 
         /* ── B. Telemetría LoRa (cada 500 ms) ────────────────────────── */
